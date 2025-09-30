@@ -206,21 +206,20 @@ function applyTriplanar(material: MaterialWithTri) {
     // normalize by a single model-wide size, anchor at pivot
     const pc = wp.sub(pivotWS).divideScalar(sizeRef); // ~[-0.5..0.5] range
 
-    const nx = Math.abs(wn.x), ny = Math.abs(wn.y), nz = Math.abs(wn.z);
-      // Planar projections into [0..1] (center anchored by +0.5)
-      const uvX: [number, number] = [ pc.z + 0.5, pc.y + 0.5 ]; // YZ
-      const uvY: [number, number] = [ pc.x + 0.5, pc.z + 0.5 ]; // XZ
-      const uvZ: [number, number] = [ pc.x + 0.5, pc.y + 0.5 ]; // XY
-
-          // Choose dominant axis only (no blending)
-          let u = 0, v = 0;
-          const weights: Array<[number, 'x'|'y'|'z']> = [[nx,'x'],[ny,'y'],[nz,'z']].sort((a,b)=>b[0]-a[0]);
-          const [, a1] = weights[0];
-          const pick = (axis: 'x'|'y'|'z'): [number, number] =>
-            axis === 'x' ? uvX : axis === 'y' ? uvY : uvZ;
-          const uv1 = pick(a1);
-          u = uv1[0];
-          v = uv1[1];
+        const nx = Math.abs(wn.x), ny = Math.abs(wn.y), nz = Math.abs(wn.z);
+          // Planar projections into [0..1] (center anchored by +0.5)
+          const uvX: [number, number] = [ pc.z + 0.5, pc.y + 0.5 ]; // YZ
+          const uvY: [number, number] = [ pc.x + 0.5, pc.z + 0.5 ]; // XZ
+          const uvZ: [number, number] = [ pc.x + 0.5, pc.y + 0.5 ]; // XY
+    
+              // Choose dominant axis only (no blending) — avoid .sort() to keep tuple types intact
+              let axis: 'x' | 'y' | 'z' = 'x';
+              if (ny > nx && ny > nz) axis = 'y';
+              else if (nz > nx && nz > ny) axis = 'z';
+    
+              const uvPick: [number, number] = axis === 'x' ? uvX : axis === 'y' ? uvY : uvZ;
+              const u = uvPick[0];
+              const v = uvPick[1];
 
     uvs[2 * i] = u;
     uvs[2 * i + 1] = v;
