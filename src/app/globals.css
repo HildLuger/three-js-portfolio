@@ -1,0 +1,191 @@
+@import "tailwindcss";
+
+/* Tailwind v4 theme: make `font-sans` use Orbitron via the variable from next/font */
+@theme {
+  --font-sans: var(--font-orbitron), ui-sans-serif, system-ui, -apple-system,
+    Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+:root {
+  /* Dark UI base */
+  --background: #0a0a0a;
+  --foreground: #ededed;
+
+  color-scheme: dark;
+}
+
+/* Global resets & defaults */
+* {
+  box-sizing: border-box;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  /* Use Tailwind’s font-sans → resolved to Orbitron by @theme above */
+  font-family: var(--font-sans);
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
+  line-height: 1.4;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Sections & containers */
+.section {
+  min-height: 100vh;
+  padding: 80px 20px 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 20px;
+}
+
+/* UI card & controls */
+.ui-card {
+  background: rgba(51, 15, 119, 0.329);
+  backdrop-filter: blur(50px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+}
+
+.ui-select {
+  background: rgba(58, 8, 105, 0.178);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  color: #fff;
+  padding: 8px 12px;
+  font-size: 14px;
+  transition: all 0.2s ease;
+  cursor: pointer;
+}
+
+.ui-select:hover {
+  background: rgba(44, 1, 114, 0.795);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.ui-select:focus {
+  outline: none;
+  border-color: rgba(187, 59, 246, 0.5);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+.ui-range {
+  width: 100%;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.ui-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  background: #5c07ac;
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+.ui-range::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  background: #5d0292;
+  border-radius: 50%;
+  cursor: pointer;
+  border: none;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+.ui-button {
+  color: rgba(255, 255, 255, 0.85);
+  text-decoration: none;
+  padding: 8px 16px;
+  border-radius: 6px;
+  transition: all 0.2s ease;
+  font-size: 14px;
+}
+
+.ui-button:hover {
+  color: white;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* Video */
+.video-frame {
+  width: 100%;
+  height: auto;
+  max-height: 400px;
+  object-fit: cover;
+}
+
+/* Navbar */
+nav { z-index: 1000; }
+
+/* Scroll hint */
+.scroll-hint {
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Locomotive scrollbar (if used) */
+.c-scrollbar {
+  width: 6px;
+  height: 100%;
+  position: absolute;
+  right: 0;
+  top: 0;
+  background: rgba(255, 255, 255, 0.1);
+  z-index: 1000;
+}
+
+.c-scrollbar_thumb {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.3);
+  border-radius: 3px;
+}
+
+/* Canvas */
+canvas { display: block; }
+
+/* Loading state */
+.loading {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+/* Responsive tweaks */
+@media (max-width: 768px) {
+  .section { padding: 60px 16px 32px; }
+  .container { padding: 0 16px; }
+  .ui-card { padding: 12px; }
+  .ui-select { padding: 6px 10px; font-size: 13px; }
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

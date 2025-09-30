@@ -1,0 +1,64 @@
+MANUAL FIX COMMANDS FOR NEXT.JS/TURBOPACK BUILD ERROR
+=====================================================
+
+Run these commands in order to fix the "Can't resolve '../../../shared/lib/utils/warn-once'" error:
+
+1. Remove parent lockfile (if exists):
+   rm -f /c/Users/marin/package-lock.json
+   rm -rf /c/Users/marin/node_modules
+
+2. Clean project build artifacts:
+   cd "C:\Users\marin\OneDrive\Desktop\3js_port\three-starter"
+   rm -rf .next node_modules package-lock.json
+
+3. Clean npm cache:
+   npm cache clean --force
+
+4. Install dependencies:
+   npm install
+
+5. Verify React installation (should show single version):
+   npm ls react
+
+6. Start development server:
+   npm run dev
+
+ALTERNATIVE: Use the automated scripts
+=====================================
+
+For Command Prompt:
+   fix-build-error.bat
+
+For PowerShell:
+   .\fix-build-error.ps1
+
+WHAT THIS FIXES:
+================
+
+The error occurs because:
+- Next.js/Turbopack is trying to resolve from wrong workspace root
+- Parent directory has package-lock.json causing conflicts
+- React version mismatches between dependencies
+- Corrupted build artifacts
+
+The fix:
+- Removes parent lockfile and node_modules
+- Cleans all build artifacts
+- Uses stable React 18 stack with compatible R3F versions
+- Forces Turbopack to use correct root directory
+- Ensures single React version throughout dependency tree
+
+EXPECTED RESULT:
+================
+
+After running the fix:
+- Development server starts without errors
+- Three.js scene loads properly
+- Material editor works with real-time controls
+- Smooth scrolling functions correctly
+- All sections snap properly
+
+If you still get errors after this fix, check:
+1. Node.js is properly installed (version 18+)
+2. You're running from the correct project directory
+3. No other npm processes are running
