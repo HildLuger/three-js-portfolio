@@ -269,7 +269,7 @@ const Scene = memo(function Scene({
     t.center.set(0.5, 0.5);
     t.repeat.set(scale, scale);
     // keep pattern expansion anchored to uv center
-    t.offset.set(0.0, - 0.0 * scale, 0.5 - 0.5 * scale);
+    t.offset.set(0.0005 - 0.0005 * scale, 0.5 - 0.5 * scale);
     t.needsUpdate = true;
   };
 
