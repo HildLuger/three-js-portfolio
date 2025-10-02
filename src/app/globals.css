@@ -1,12 +1,11 @@
 @import "tailwindcss";
 
-/* Tailwind v4 theme: make `font-sans` use Orbitron via the variable from next/font */
-@theme {
-  --font-sans: var(--font-orbitron), ui-sans-serif, system-ui, -apple-system,
-    Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
-}
+/* Map Tailwind's `font-sans` to Orbitron without using the @theme at-rule
+   (avoids editor “unknownAtRules” warnings while keeping Tailwind working). */
 
 :root {
+    --font-sans: var(--font-orbitron), ui-sans-serif, system-ui, -apple-system,
+    Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
   /* Dark UI base */
   --background: #0a0a0a;
   --foreground: #ededed;

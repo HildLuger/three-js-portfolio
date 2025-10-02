@@ -1,7 +1,9 @@
 'use client';
 
+
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import dynamic from 'next/dynamic';
+import Image from 'next/image';
 
 // R3F canvas only in the browser
 const ThreeCanvas = dynamic(() => import('./ThreeCanvas').then(m => m.ThreeCanvas), {
@@ -69,6 +71,10 @@ interface Lenis {
   scrollTo(target: number | string | Element, options?: { duration?: number; easing?: LenisEasing; lock?: boolean }): void;
   raf(time: number): void;
   destroy(): void;
+   // optional API on real Lenis – used only for reading virtual scroll & cleanup
+ scroll?: number;
+ on?(event: 'scroll', handler: (e: unknown) => void): void;
+ off?(event: 'scroll', handler?: (e: unknown) => void): void;
 }
 type LenisConstructor = new (options?: LenisOptions) => Lenis;
 
@@ -142,7 +148,7 @@ export default function Page() {
       return () => v.removeEventListener('ended', onEnd);
     }, []);
   /* --- Carousel data (6 thumbs) --- */
-   const thumbs = useMemo(
+    const thumbs = useMemo(
         () => [
           { src: '/thumb1.jpg', href: 'https://wh-web-gl.vercel.app/', alt: '3D web game' },
           { src: '/thumb2.jpg', href: 'https://next-js-r3f-tailwind.vercel.app/globe', alt: 'three.js project' },
@@ -161,10 +167,14 @@ export default function Page() {
 
   const touchX = useRef(0);
   const onTouchStartCarousel = (e: React.TouchEvent) => { touchX.current = e.touches[0]?.clientX ?? 0; };
-  const onTouchEndCarousel   = (e: React.TouchEvent) => {
-    const dx = (e.changedTouches[0]?.clientX ?? touchX.current) - touchX.current;
-    if (Math.abs(dx) > 30) (dx < 0 ? nextSlide() : prevSlide());
-  };
+    const onTouchEndCarousel   = (e: React.TouchEvent) => {
+      const dx = (e.changedTouches[0]?.clientX ?? touchX.current) - touchX.current;
+      if (Math.abs(dx) > 30) {
+        if (dx < 0) nextSlide();
+        else prevSlide();
+      }
+    };
+     
 
   const collect = useCallback(() => {
     const root = contentRef.current;
@@ -246,7 +256,7 @@ export default function Page() {
 
         const raf = (time: number) => {
           lenis.raf(time);
-          virtScrollRef.current = (lenis as any).scroll ?? virtScrollRef.current;
+          virtScrollRef.current = typeof lenis.scroll === 'number' ? lenis.scroll : virtScrollRef.current;
           updateActive();
           rafRef.current = requestAnimationFrame(raf);
         };
@@ -258,7 +268,7 @@ export default function Page() {
 
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      try { (lenisRef.current as any)?.off?.('scroll'); } catch {}
+      try { lenisRef.current?.off?.('scroll'); } catch {}
       lenisRef.current?.destroy?.();
       lenisRef.current = null;
     };
@@ -402,7 +412,7 @@ export default function Page() {
             >
               <source src="/demo.mp4" type="video/mp4" />
             </video>
-            {active === 1 && (
+            {active === 1 ? (
               <div className="video-ctrl" data-no-snap>
                 <button
                   className="vc-btn"
@@ -436,7 +446,7 @@ export default function Page() {
                   />
                 </div>
               </div>
-            )}
+             ) : null}
             <div className="snap-text">
               <h1>High Quality 3D</h1>
               <p>Real-time and pre-rendered graphics to display the best experience.</p>
@@ -465,8 +475,23 @@ export default function Page() {
                 >
                   {thumbs.map((t, i) => (
                     <div className="slide" key={i} aria-hidden={i !== slide}>
-                      <a href={t.href} target="_blank" rel="noopener noreferrer" title={t.alt}>
-                        <img src={t.src} alt={t.alt} loading="lazy" />
+                      <a
+                        href={t.href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title={t.alt}
+                        className="slide-link"
+                      >
+                        <div className="img-wrap">
+                          <Image
+                            src={t.src}
+                            alt={t.alt}
+                            fill
+                            sizes="(max-width: 900px) 78vw, 50vw"
+                            priority={i === 0}
+                            style={{ objectFit: 'cover', userSelect: 'none' }}
+                          />
+                        </div>
                       </a>
                     </div>
                   ))}
@@ -607,13 +632,8 @@ export default function Page() {
           transition: transform .45s cubic-bezier(.2,.7,.2,1);
         }
         .slide { flex: 0 0 100%; width: 100%; height: 100%; }
-        .slide a, .slide img {
-          display: block;
-          width: 100%; height: 100%;
-          object-fit: cover;
-          user-select: none;
-          -webkit-user-drag: none;
-        }
+        .slide-link { display: block; width: 100%; height: 100%; }
+        .img-wrap { position: relative; width: 100%; height: 100%; }
 
         /* Thin side hit-areas ≈ navbar height */
         .carousel-hit {

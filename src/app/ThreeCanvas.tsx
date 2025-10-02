@@ -194,13 +194,13 @@ function applyTriplanar(material: MaterialWithTri) {
 
   const pos = geo.attributes.position as THREE.BufferAttribute;
   const norm = geo.attributes.normal  as THREE.BufferAttribute;
-  const nMat = new THREE.Matrix3().getNormalMatrix((obj as any).matrixWorld);
+  const nMat = new THREE.Matrix3().getNormalMatrix(obj.matrixWorld);
 
   const uvs = new Float32Array(pos.count * 2);
 
   for (let i = 0; i < pos.count; i++) {
     // world-space position & normal
-    const wp = new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i)).applyMatrix4((obj as any).matrixWorld);
+    const wp = new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i)).applyMatrix4(obj.matrixWorld);
     const wn = new THREE.Vector3(norm.getX(i), norm.getY(i), norm.getZ(i)).applyMatrix3(nMat).normalize();
 
     // normalize by a single model-wide size, anchor at pivot
@@ -269,7 +269,7 @@ const Scene = memo(function Scene({
     t.center.set(0.5, 0.5);
     t.repeat.set(scale, scale);
     // keep pattern expansion anchored to uv center
-    t.offset.set(0.0005 - 0.0005 * scale, 0.5 - 0.5 * scale);
+    t.offset.set(0, -0 * scale); 
     t.needsUpdate = true;
   };
 
@@ -347,12 +347,16 @@ const Scene = memo(function Scene({
       const thickness    = (params.thickness ?? 0)    > EPS ? (params.thickness as number)    : 0;
       const clearcoat    = (params.clearcoat ?? 0)    > EPS ? (params.clearcoat as number)    : 0;
 
-      const applyIfChanged = <K extends keyof THREE.MeshPhysicalMaterialParameters>(key: K, val: any) => {
-        if (lastApplied.current[key] !== val) {
-          (m as any)[key] = val;
-          lastApplied.current[key] = val;
-        }
-      };
+           const applyIfChanged = <K extends keyof THREE.MeshPhysicalMaterialParameters>(
+                key: K,
+                val: THREE.MeshPhysicalMaterialParameters[K]
+              ) => {
+                if (lastApplied.current[key] !== val) {
+                  const mm = m as unknown as Record<string, unknown>;
+                  mm[key as string] = val as unknown;
+                  lastApplied.current[key] = val;
+                }
+              };
 
       applyIfChanged('roughness', params.roughness ?? 0.5);
       applyIfChanged('metalness', params.metalness ?? 0);
@@ -397,19 +401,20 @@ const Scene = memo(function Scene({
 
     // Also push the pivot to the WebGL triplanar path
     if (!IS_WEBGPU && sharedMatRef.current) {
-      (sharedMatRef.current as any).userData.triUniforms.triPivot.value.copy(pivotWS);
+      (sharedMatRef.current as MaterialWithTri).userData.triUniforms!.triPivot.value.copy(pivotWS);
     }
 
-    root.traverse((obj: any) => {
-      if (obj?.isMesh) {
-        obj.castShadow = true;
-        obj.receiveShadow = true;
-        obj.material = sharedMatRef.current!;
-        if (IS_WEBGPU) {
-          boxProjectUVsCentered(obj.geometry as THREE.BufferGeometry, obj, pivotWS, sizeRef, 0.18);
-        }
-      }
-    });
+      root.traverse((o) => {
+            if ((o as THREE.Mesh).isMesh) {
+              const mesh = o as THREE.Mesh;
+              mesh.castShadow = true;
+              mesh.receiveShadow = true;
+              mesh.material = sharedMatRef.current!;
+              if (IS_WEBGPU) {
+                boxProjectUVsCentered(mesh.geometry as THREE.BufferGeometry, mesh, pivotWS, sizeRef, 0.18);
+              }
+            }
+          });
   }, [isGLB, gltfScene, meshIndex]);
 
   // Primitives are indices 5..9
@@ -503,7 +508,9 @@ const Scene = memo(function Scene({
 export function ThreeCanvas() {
   const [meshIndex, setMeshIndex] = useState(0);
   const [matIndex, setMatIndex] = useState(0);
-  const [params, setParams] = useState<THREE.MeshPhysicalMaterialParameters & { color?: string }>(MATERIALS[0].base as any);
+  const [params, setParams] = useState<THREE.MeshPhysicalMaterialParameters & { color?: string }>(
+    MATERIALS[0].base as THREE.MeshPhysicalMaterialParameters & { color?: string }
+  );
   const currentMapUrl = (MATERIALS[matIndex] as { mapUrl?: string }).mapUrl;
 
   const [texScale, setTexScale] = useState(0.6);
@@ -528,12 +535,14 @@ export function ThreeCanvas() {
   }, []);
 
   useEffect(() => {
-    setParams(prev => {
-      const base = MATERIALS[matIndex].base as any;
-      const next = { ...prev, ...base };
-      if (currentMapUrl) delete (next as any).color;
-      return next;
-    });
+       setParams(prev => {
+            const base = MATERIALS[matIndex].base as Partial<THREE.MeshPhysicalMaterialParameters & { color?: string }>;
+            const next: THREE.MeshPhysicalMaterialParameters & { color?: string } = { ...prev, ...base };
+            if (currentMapUrl) {
+              delete (next as { color?: string }).color;
+            }
+            return next;
+          });
   }, [matIndex, currentMapUrl]);
 
   useEffect(() => { gsap.to({}, { duration: 0.25 }); }, [meshIndex, matIndex]);
@@ -551,13 +560,13 @@ export function ThreeCanvas() {
           style={{ touchAction: 'pan-y' }}
           className="w-full h-full"
           dpr={safeMode ? 1 : [1, 1.25]}
-          gl={(canvas) => {
-            if (IS_WEBGPU) {
-              const r = new WebGPURenderer({ canvas, antialias: !safeMode }) as unknown as THREE.Renderer;
-              return r;
-            }
-            return new THREE.WebGLRenderer({ canvas, antialias: !safeMode, alpha: false, powerPreference: 'high-performance' });
-          }}
+               gl={(canvas) => {
+                  if (IS_WEBGPU) {
+                    const r = new WebGPURenderer({ canvas, antialias: !safeMode }) as unknown as THREE.WebGLRenderer;
+                    return r;
+                  }
+                  return new THREE.WebGLRenderer({ canvas, antialias: !safeMode, alpha: false, powerPreference: 'high-performance' });
+                }}
           camera={{ position: [0, 0, 4], fov: 50, near: 0.1, far: 100 }}
           performance={{ min: 0.5 }}
           onCreated={({ gl, scene }) => {
