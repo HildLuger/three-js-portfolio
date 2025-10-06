@@ -366,7 +366,7 @@ const SmartOrbitControls = memo(function SmartOrbitControls() {
       minDistance={isMobile ? 4 : undefined}
       maxDistance={isMobile ? 10 : undefined}
       autoRotate
-      autoRotateSpeed={1.5}
+      autoRotateSpeed={2}
       target={[0, 0, 0]}
       minAzimuthAngle={-Infinity}
       maxAzimuthAngle={Infinity}
@@ -1216,7 +1216,7 @@ export function ThreeCanvas() {
             });
           }}
           camera={{ position: [0, 0, 4], fov: 50, near: 0.1, far: 100 }}
-          performance={{ min: 0.5, max: 1, debounce: 100 }}
+          performance={{ min: 0.5, max: 1, debounce: 50 }}
           onCreated={(state) => {
             const gl = state.gl as unknown as THREE.WebGLRenderer;
             const scene = state.scene as THREE.Scene;
@@ -1243,7 +1243,7 @@ export function ThreeCanvas() {
           <StableEnvironment 
             ctxVersion={ctxVersion}
               preset="sunset"
-              resolution={safeMode ? 64 : 128}
+              resolution={safeMode ? 8 : 16}
               blur={bgBlur}
             />
 
