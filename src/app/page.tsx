@@ -200,6 +200,9 @@ export default function Page() {
       if (d < dist) { dist = d; best = i; }
     }
     setActive(best);
+    
+    // Dispatch event for navbar to listen to
+    window.dispatchEvent(new CustomEvent('sectionchange', { detail: best }));
   }, []);
 
   const goToY = useCallback((y: number, ms = SCROLL_MS) => {
@@ -295,7 +298,8 @@ export default function Page() {
 
   // Nav / dots → smooth, centered
   useEffect(() => {
-    const links = Array.from(document.querySelectorAll<HTMLAnchorElement>('nav a[href^="#"]'));
+    let links: HTMLAnchorElement[] = [];
+    
     const onClick = (ev: Event) => {
       const a = ev.currentTarget as HTMLAnchorElement;
       const id = a.getAttribute('href');
@@ -309,8 +313,18 @@ export default function Page() {
         history.replaceState(null, '', id);
       }
     };
-    links.forEach(a => a.addEventListener('click', onClick));
-    return () => links.forEach(a => a.removeEventListener('click', onClick));
+    
+    // Small delay to ensure navbar is mounted
+    const timer = setTimeout(() => {
+      // Select ALL navigation links (navbar + any other nav elements)
+      links = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href^="#"]'));
+      links.forEach(a => a.addEventListener('click', onClick));
+    }, 100);
+
+    return () => {
+      clearTimeout(timer);
+      links.forEach(a => a.removeEventListener('click', onClick));
+    };
   }, [scrollToIndex]);
 
   // Wheel / touch → step between sections with settle
@@ -365,9 +379,13 @@ export default function Page() {
     const onTouchStart = (ev: TouchEvent) => { touchStartY = ev.touches[0]?.clientY ?? 0; };
     const onTouchEnd = (ev: TouchEvent) => {
       if (isAnimatingRef.current) return;
+      
+      // Don't snap on touch if we're in the first section (allow orbit only)
+      const idx = currentIndex();
+      if (idx === 0) return;
+      
       const dy = touchStartY - (ev.changedTouches[0]?.clientY ?? touchStartY);
       const dir = Math.abs(dy) < 36 ? 0 : (dy > 0 ? 1 : -1);
-      const idx = currentIndex();
       scrollToIndex(Math.max(0, Math.min(sectionsRef.current.length - 1, idx + dir)), dir === 0 ? 800 : SCROLL_MS);
     };
 
@@ -599,7 +617,7 @@ export default function Page() {
         /* --- Centered-top slider carousel (smaller, narrower) --- */
         .carousel {
           position: absolute;
-          top: 8%;
+          top: 14%;
           left: 50%;
           transform: translateX(-50%);
           z-index: 1;
@@ -609,11 +627,17 @@ export default function Page() {
           place-items: center;
           gap: 0.5rem;
         }
+        @media (min-width: 640px) {
+          .carousel { top: 10%; }
+        }
         @media (min-width: 900px) {
-          .carousel { width: min(50vw, 520px); top: 10%; }
+          .carousel { width: min(50vw, 520px); }
         }
         @media (max-height: 700px) {
-          .carousel { top: 6%; }
+          .carousel { top: 12%; }
+        }
+        @media (min-width: 640px) and (max-height: 700px) {
+          .carousel { top: 8%; }
         }
 
         .carousel-viewport {

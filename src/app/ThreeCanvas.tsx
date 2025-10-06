@@ -1065,6 +1065,9 @@ export function ThreeCanvas() {
     MATERIALS[0].base as THREE.MeshPhysicalMaterialParameters & { color?: string },
   );
   
+  // Canvas ref for touch scroll prevention
+  const canvasRef = useRef<HTMLDivElement>(null);
+  
   // Current texture URL (if the selected material has one)
   const currentMapUrl = (MATERIALS[matIndex] as { mapUrl?: string }).mapUrl;
 
@@ -1098,6 +1101,47 @@ export function ThreeCanvas() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
+  // ========== DISABLE TOUCH SCROLL IN FIRST SECTION (MOBILE ONLY) ==========
+  // On mobile, completely prevent scroll in the first section (3D viewer only)
+  // Other sections scroll normally
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    // Check if we're in the first section (hero with 3D canvas)
+    const isInFirstSection = () => {
+      const heroSection = document.getElementById('hero');
+      if (!heroSection) return false;
+      
+      const rect = heroSection.getBoundingClientRect();
+      const viewportHeight = window.innerHeight;
+      
+      // First section is visible if it occupies significant viewport
+      return rect.top > -viewportHeight * 0.3 && rect.bottom > viewportHeight * 0.7;
+    };
+
+    const handleTouchMove = (e: TouchEvent) => {
+      // Don't prevent if touch is on UI controls (sliders, buttons, selects)
+      const target = e.target as HTMLElement;
+      if (target.closest('.ui-range, .ui-select, .ui-button, input, select, button, [data-no-snap]')) {
+        return; // Allow normal interaction with UI elements
+      }
+
+      // Completely prevent scroll in first section on mobile (for canvas area only)
+      if (isInFirstSection()) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+
+    // Use passive: false to allow preventDefault
+    canvas.addEventListener('touchmove', handleTouchMove, { passive: false });
+
+    return () => {
+      canvas.removeEventListener('touchmove', handleTouchMove);
+    };
+  }, []);
+
   useEffect(() => {
     setParams((prev) => {
       const base = MATERIALS[matIndex].base as Partial<THREE.MeshPhysicalMaterialParameters & { color?: string }>;
@@ -1119,7 +1163,7 @@ export function ThreeCanvas() {
   };
 
   return (
-    <div className="w-full h-screen relative">
+    <div ref={canvasRef} className="w-full h-screen relative">
         <Canvas
           shadows={!safeMode}
           style={{ touchAction: 'pan-y' }}
@@ -1222,7 +1266,7 @@ export function ThreeCanvas() {
             aria-expanded={panelOpen}
             onClick={() => setPanelOpen((v) => !v)}
             className="fixed z-[65] right-4
-                       top-[calc(env(safe-area-inset-top)+64px)]
+                       top-[calc(env(safe-area-inset-top)+88px)]
                        lg:top-24
                        rounded-full px-3 py-2 bg-violet-400/80 text-white shadow-lg backdrop-blur
                        hover:bg-purple-500/90 focus:outline-none focus:ring-2 focus:ring-purple-400/50
