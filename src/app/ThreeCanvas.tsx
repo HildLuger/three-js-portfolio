@@ -1083,7 +1083,7 @@ export function ThreeCanvas() {
   const currentMapUrl = (MATERIALS[matIndex] as { mapUrl?: string }).mapUrl;
 
   // Texture scaling/tiling factor
-  const [texScale, setTexScale] = useState(0.6);
+  const [texScale, setTexScale] = useState(0.56);
 
   // ========== RENDERING SETTINGS (CONSTANT) ==========
   // These values never change, so we use useMemo to prevent re-renders
