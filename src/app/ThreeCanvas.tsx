@@ -319,6 +319,15 @@ const SmartOrbitControls = memo(function SmartOrbitControls() {
   const controlsRef = useRef<React.ElementRef<typeof OrbitControls>>(null);
   const { invalidate } = useThree();
   const rafRef = useRef<number | null>(null);
+  const [isMobile, setIsMobile] = useState(false);
+
+  useEffect(() => {
+    // Detect mobile device
+    setIsMobile(window.innerWidth < 768);
+    const handleResize = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   useEffect(() => {
     const controls = controlsRef.current;
@@ -353,9 +362,11 @@ const SmartOrbitControls = memo(function SmartOrbitControls() {
       enableDamping
       dampingFactor={0.1}
       enablePan={false}
-      enableZoom={false}
+      enableZoom={isMobile}
+      minDistance={isMobile ? 4 : undefined}
+      maxDistance={isMobile ? 10 : undefined}
       autoRotate
-      autoRotateSpeed={2}
+      autoRotateSpeed={1.5}
       target={[0, 0, 0]}
       minAzimuthAngle={-Infinity}
       maxAzimuthAngle={Infinity}
@@ -1168,7 +1179,7 @@ export function ThreeCanvas() {
           shadows={!safeMode}
           style={{ touchAction: 'pan-y' }}
           className="w-full h-full"
-          dpr={safeMode ? 1 : [1, 1.5]}
+          dpr={safeMode ? 1 : Math.min(window.devicePixelRatio, 1.5)}
           frameloop="demand"
           // r3f accepts a Promise here at runtime
           // @ts-expect-error - async renderer factory is supported by r3f
@@ -1205,7 +1216,7 @@ export function ThreeCanvas() {
             });
           }}
           camera={{ position: [0, 0, 4], fov: 50, near: 0.1, far: 100 }}
-          performance={{ min: 0.5, max: 1, debounce: 200 }}
+          performance={{ min: 0.5, max: 1, debounce: 100 }}
           onCreated={(state) => {
             const gl = state.gl as unknown as THREE.WebGLRenderer;
             const scene = state.scene as THREE.Scene;
@@ -1232,7 +1243,7 @@ export function ThreeCanvas() {
           <StableEnvironment 
             ctxVersion={ctxVersion}
               preset="sunset"
-              resolution={safeMode ? 128 : 256}
+              resolution={safeMode ? 64 : 128}
               blur={bgBlur}
             />
 
