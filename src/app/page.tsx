@@ -153,8 +153,8 @@ export default function Page() {
           { src: '/thumb1.jpg', href: 'https://wh-web-gl.vercel.app/', alt: '3D web game' },
           { src: '/thumb2.jpg', href: 'https://next-js-r3f-tailwind.vercel.app/globe', alt: 'three.js project' },
           { src: '/thumb3.jpg', href: 'https://asset-configurator2.vercel.app/', alt: '3D Asset Configurator' },
-          { src: '/thumb4.jpg', href: 'https://lnkd.in/dhbkJmK9', alt: 'Stylized Anatomy Viewer' },
-          { src: '/thumb5.jpg', href: 'https://lnkd.in/dTcfDgHk', alt: 'Three.js Physics' },
+          { src: '/thumb4.jpg', href: 'https://anatomy1.vercel.app/', alt: 'Stylized Anatomy Viewer' },
+          { src: '/thumb5.jpg', href: 'https://sys-manager1.vercel.app/', alt: 'Three.js Physics' },
           { src: '/thumb6.jpg', href: 'https://www.artstation.com/longshortdreamslsd', alt: '3D  Portfolio' },
         ],
         []
