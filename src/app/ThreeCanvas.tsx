@@ -395,47 +395,6 @@ function FrameInvalidator() {
   return null;
 }
 
-/**
- * StableEnvironment - Memoized wrapper for the Environment component.
- * 
- * The Environment component loads an HDR image that provides:
- * - Realistic lighting from all directions
- * - Reflections on metallic/glossy materials
- * - Beautiful background scenery
- * 
- * This wrapper is memoized to prevent the environment from reloading
- * when other parts of the scene change (meshes, materials, textures).
- * 
- * Without memoization, changing a texture would cause the environment
- * to reload, creating a visible "flash" or lighting change.
- * 
- * @param ctxVersion - Context version for forcing reload after context loss
- * @param preset - Preset name (e.g., 'sunset', 'city', 'forest')
- * @param resolution - Resolution of the environment map (128, 256, 512, etc.)
- * @param blur - Blur amount for the background
- */
-const StableEnvironment = memo(function StableEnvironment({ 
-  ctxVersion, 
-  preset, 
-  resolution, 
-  blur 
-}: { 
-  ctxVersion: number; 
-  preset: string; 
-  resolution: number; 
-  blur: number 
-}) {
-  return (
-    <Environment 
-      key={`env-${ctxVersion}`} 
-      preset={preset as 'sunset'} 
-      background 
-      frames={Infinity}
-      resolution={resolution} 
-      blur={blur}
-    />
-  );
-});
 
 /**
  * ============================================================================
@@ -1240,12 +1199,13 @@ export function ThreeCanvas() {
             }}
           />
 
-          <StableEnvironment 
-            ctxVersion={ctxVersion}
-              preset="sunset"
-              resolution={safeMode ? 8 : 16}
-              blur={bgBlur}
-            />
+          {/* Environment using local HDR file */}
+          <Environment 
+            key={`env-${ctxVersion}`}
+            files="/sunset.hdr"
+            background
+            blur={bgBlur}
+          />
 
           <Suspense fallback={null}>
             <Scene
