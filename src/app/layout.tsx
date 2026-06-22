@@ -14,15 +14,16 @@ const orbitron = Orbitron({
 export const metadata: Metadata = {
   title: 'Interactive 3D Portfolio - Three.js Experience',
   description:
-    'Explore interactive 3D scenes with real-time material editing, smooth scrolling animations, and responsive design. Built with Three.js, GSAP, and Locomotive Scroll.',
+    'Explore interactive 3D scenes with real-time material editing, smooth scrolling animations, and responsive design. Built with Three.js WebGPU and React Three Fiber.',
   keywords: [
     'Three.js',
     '3D',
+    'WebGPU',
     'WebGL',
     'Interactive',
     'Portfolio',
-    'GSAP',
-    'Locomotive Scroll',
+    'React Three Fiber',
+    'TSL',
     'React',
     'Next.js',
   ],

@@ -3,25 +3,54 @@
 // React and type imports
 import * as React from 'react';
 import type { CSSProperties } from 'react';
-import { useRef, useEffect, useState, Suspense, memo } from 'react';
+import { useRef, useEffect, useState, useCallback, Suspense, memo } from 'react';
 
-// React Three Fiber - React renderer for Three.js
-import { Canvas, useThree } from '@react-three/fiber';
+// React Three Fiber - React renderer for Three.js (v9, React 19 compatible)
+import { Canvas, useThree, useFrame, extend } from '@react-three/fiber';
 
 // Drei - useful helpers and components for R3F
 import { OrbitControls, Environment, useGLTF, Html, Preload } from '@react-three/drei';
 
-// Three.js - 3D library
-import * as THREE from 'three';
+// Bottom-left sun control overlay (controlled component)
+import SunControl, { sunDirectionFromState } from './SunControl';
 
-// GSAP - animation library (used for smooth transitions)
-import gsap from 'gsap';
+// WebGPU/TSL post-processing: SSGI + bloom + lens flare. Owns the render loop,
+// so it is only mounted on the WebGPU backend (not the WebGL2 fallback).
+import PostFX from './PostFX';
+
+// Three.js WebGPU build. This is the modern, high-performance renderer.
+// Importing from 'three/webgpu' gives us WebGPURenderer + the node material system.
+// WebGPURenderer automatically falls back to a WebGL2 backend when WebGPU is unavailable.
+import * as THREE from 'three/webgpu';
+
+// TSL (Three Shading Language) - the WebGPU-native way to author shaders.
+// Used here for triplanar texturing that works without UV coordinates.
+import {
+  texture,
+  vec3,
+  uniform,
+  positionWorld,
+  positionView,
+  normalWorld,
+  normalView,
+  mix,
+  smoothstep,
+  clamp,
+  sin,
+} from 'three/tsl';
+
+// WebGPU/TSL node versions of the classic Sky + Water examples. The legacy
+// three/addons/objects/Sky.js and Water.js are GLSL ShaderMaterials and do NOT
+// run on WebGPURenderer; SkyMesh + WaterMesh are their node-based equivalents.
+import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
+import { WaterMesh } from 'three/addons/objects/WaterMesh.js';
 
 /**
- * Check if the browser supports WebGPU (the next-generation graphics API).
- * WebGPU provides better performance than WebGL on supported browsers.
+ * Register every three/webgpu class with R3F's reconciler so that JSX scene
+ * objects are constructed from the same module instance the WebGPURenderer uses.
  */
-const IS_WEBGPU = typeof navigator !== 'undefined' && 'gpu' in navigator;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+extend(THREE as any);
 
 /**
  * Minimal TypeScript type for GLTF models loaded with useGLTF.
@@ -29,64 +58,10 @@ const IS_WEBGPU = typeof navigator !== 'undefined' && 'gpu' in navigator;
  */
 type GLTFLike = { scene: THREE.Object3D };
 
-/**
- * ============================================================================
- * WEBGPU RENDERER LOADER
- * ============================================================================
- * This section handles loading the WebGPU renderer dynamically.
- * WebGPU is a modern graphics API that provides better performance than WebGL.
- */
-
-/**
- * TypeScript type for the WebGPU renderer constructor.
- * We define it manually to avoid importing WebGPU-specific types.
- */
-type WebGPUCtor = new (opts: { canvas: HTMLCanvasElement; antialias?: boolean }) => {
-  init?: () => Promise<void>;
-};
-
-/**
- * Dynamically load the WebGPU renderer from Three.js.
- * 
- * This function:
- * 1. Checks if the browser supports WebGPU
- * 2. Tries to load from the newer 'three/webgpu' export (Three.js r150+)
- * 3. Falls back to the legacy addons path for older Three.js versions
- * 4. Returns null if WebGPU is not available or loading fails
- * 
- * @returns Promise that resolves to the WebGPURenderer constructor or null
- */
-async function loadWebGPURenderer(): Promise<WebGPUCtor | null> {
-  if (!IS_WEBGPU) return null;
-  
-  // Try newer Three.js export path (recommended)
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const mod = (await import('three/webgpu')) as any;
-    return mod?.WebGPURenderer ?? null;
-  } catch {
-    // Fallback: try older Three.js addons path for backwards compatibility
-    try {
-      // Dynamic import using Function constructor to bypass bundler resolution
-      // This allows us to build the path at runtime
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const importShim: (s: string) => Promise<any> =
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (new Function('s', 'return import(s)')) as any;
-      const legacyPath = ['three','addons','renderers','webgpu','WebGPURenderer.js'].join('/');
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod2 = await importShim(legacyPath) as any;
-      return mod2?.WebGPURenderer ?? null;
-    } catch {
-      return null;
-    }
-  }
-}
-/**
- * ============================================================================
- * THREE.JS OPTIMIZATION & UTILITIES
- * ============================================================================
- */
+// A renderer can be either the WebGPU backend or its WebGL2 fallback; both share
+// the properties we touch (toneMapping, exposure, etc.), so we use a loose type.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyRenderer = any;
 
 /**
  * Enable Three.js caching system for better performance.
@@ -95,107 +70,65 @@ async function loadWebGPURenderer(): Promise<WebGPUCtor | null> {
 THREE.Cache.enabled = true;
 
 /**
- * Log WebGPU availability status to the console for debugging.
- * Helps developers know if WebGPU is being used or if it falls back to WebGL.
- */
-if (typeof window !== 'undefined') {
-  console.log('WebGPU Available:', 'gpu' in navigator);
-}
-
-/**
  * ============================================================================
  * GLB MODEL LOADER COMPONENT
  * ============================================================================
- * This component loads 3D models in GLB/GLTF format and notifies when ready.
- */
-
-/**
- * GlbNode - Loads and renders a GLB/GLTF 3D model file.
- * 
- * This component:
- * 1. Uses useGLTF hook to load the model (with automatic caching)
- * 2. Extracts the scene object from the loaded GLTF
- * 3. Memoizes the node to prevent unnecessary re-renders
- * 4. Notifies parent component when the model is ready
- * 
- * @param path - File path to the GLB/GLTF model
- * @param onReady - Callback function called when the model is loaded and mounted
  */
 function GlbNode({ path, onReady }: { path: string; onReady?: () => void }) {
-  // Load the GLTF model using Drei's useGLTF hook (handles caching automatically)
   const gltf = useGLTF(path) as unknown as GLTFLike;
-  
-  // Memoize the scene node to avoid recreating it on every render
-  // Falls back to an empty group if the model hasn't loaded yet
+
   const node = React.useMemo(
     () => (gltf?.scene ?? new THREE.Group()) as THREE.Object3D,
-    [gltf]
+    [gltf],
   );
 
-  // Notify parent component when the model is ready
-  // We depend on 'gltf' instead of 'node' to avoid retriggering when materials are assigned
+  // Keep the latest callback in a ref so changing its identity on every parent
+  // render does NOT retrigger the effect (which would cause an update loop).
+  const onReadyRef = useRef(onReady);
+  onReadyRef.current = onReady;
+
   React.useEffect(() => {
-    onReady?.();
-  }, [onReady, gltf]);
-  
+    onReadyRef.current?.();
+  }, [gltf]);
+
   return <primitive object={node} />;
 }
 
 /**
  * ============================================================================
- * WEBGL CONTEXT LOSS PROTECTION
+ * CONTEXT LOSS PROTECTION
  * ============================================================================
- * Handles WebGL context loss/restore events (when GPU resources are lost).
- */
-
-/**
- * ContextLossProtector - Monitors and handles WebGL context loss events.
- * 
- * Context loss can occur when:
- * - GPU driver crashes
- * - Browser tab is suspended for too long
- * - Device runs out of GPU memory
- * - User switches graphics cards (laptops)
- * 
- * This component:
- * 1. Listens for 'webglcontextlost' events and prevents default behavior
- * 2. Notifies parent component to enable safe mode (reduced quality)
- * 3. Listens for 'webglcontextrestored' events
- * 4. Restores renderer settings and notifies parent to resume normal operation
- * 
- * @param onLost - Callback when WebGL context is lost
- * @param onRestored - Callback when WebGL context is restored
+ * Handles graphics context loss/restore. On the WebGL2 fallback backend the
+ * 'webglcontextlost' events fire; on the WebGPU backend device loss is handled
+ * by the renderer itself, so these listeners are simply a safety net.
  */
 function ContextLossProtector({ onLost, onRestored }: { onLost?: () => void; onRestored?: () => void }) {
   const { gl } = useThree();
-  
-  useEffect(() => {
-    const c = gl.domElement as HTMLCanvasElement;
 
-    // Handle context loss: prevent default and notify parent
+  useEffect(() => {
+    const renderer = gl as AnyRenderer;
+    const c = renderer.domElement as HTMLCanvasElement;
+
     const handleLost = (e: Event) => {
-      e.preventDefault(); // Allows context to be restored
+      e.preventDefault();
       onLost?.();
     };
-    
-    // Handle context restore: reset renderer settings and notify parent
+
     const handleRestored = () => {
-      (gl as THREE.WebGLRenderer).toneMapping = THREE.ACESFilmicToneMapping;
-      (gl as THREE.WebGLRenderer).outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
       onRestored?.();
     };
 
-    // Register event listeners
     c.addEventListener('webglcontextlost', handleLost as EventListener, { passive: false });
     c.addEventListener('webglcontextrestored', handleRestored as EventListener);
 
-    // Cleanup listeners on unmount
     return () => {
       c.removeEventListener('webglcontextlost', handleLost as EventListener);
       c.removeEventListener('webglcontextrestored', handleRestored as EventListener);
     };
   }, [gl, onLost, onRestored]);
-  
+
   return null;
 }
 
@@ -203,162 +136,83 @@ function ContextLossProtector({ onLost, onRestored }: { onLost?: () => void; onR
  * ============================================================================
  * RENDERER & SCENE SETTINGS COMPONENTS
  * ============================================================================
- * These components control various rendering properties.
- * They are memoized to prevent unnecessary re-renders when parent state changes.
  */
 
-/**
- * Exposure - Controls the overall brightness of the rendered scene.
- * 
- * Tone mapping exposure determines how bright the final image appears.
- * Higher values = brighter image, lower values = darker image.
- * 
- * This component:
- * - Sets the renderer's toneMappingExposure value
- * - Restores the previous value on unmount
- * - Is memoized to only re-render when 'value' changes
- * 
- * @param value - Exposure value (typically 0.5 - 1.5, default: 0.62)
- */
+/** Controls overall scene brightness via tone mapping exposure. */
 const Exposure = memo(function Exposure({ value = 0.62 }: { value: number }) {
   const { gl } = useThree();
-  
+
   useEffect(() => {
-    const renderer = gl as THREE.WebGLRenderer;
+    const renderer = gl as AnyRenderer;
     const prev = renderer.toneMappingExposure;
     renderer.toneMappingExposure = value;
-    
     return () => {
       renderer.toneMappingExposure = prev;
     };
   }, [gl, value]);
-  
+
   return null;
 });
 
-/**
- * TypeScript extension of THREE.Scene to include environmentIntensity property.
- * This property controls how strongly the environment map affects materials.
- */
 type SceneWithEnvIntensity = THREE.Scene & { environmentIntensity?: number };
 
-/**
- * SceneEnvIntensity - Controls the intensity of environment map reflections.
- * 
- * The environment map provides realistic reflections and ambient lighting.
- * This multiplier affects how strongly materials reflect the environment.
- * 
- * This component:
- * - Sets the scene's environmentIntensity
- * - Affects all materials that use environment maps
- * - Is memoized to prevent unnecessary re-renders
- * 
- * @param value - Intensity multiplier (0 = no environment, 1 = full strength, default: 0.6)
- */
+/** Controls the intensity of environment-map reflections on materials. */
 const SceneEnvIntensity = memo(function SceneEnvIntensity({ value = 0.6 }: { value?: number }) {
   const { scene } = useThree();
-  
+
   useEffect(() => {
     const s = scene as SceneWithEnvIntensity;
     const prev = s.environmentIntensity;
     s.environmentIntensity = value;
-    
     return () => {
       s.environmentIntensity = prev ?? 1;
     };
   }, [scene, value]);
-  
+
   return null;
 });
 
-/**
- * TypeScript extension of THREE.Scene to include background properties.
- * These properties control the appearance of the environment background.
- */
 type SceneWithBg = THREE.Scene & { backgroundIntensity?: number; backgroundBlurriness?: number };
 
-/**
- * BackgroundTune - Controls the intensity and blur of the environment background.
- * 
- * This component:
- * - backgroundIntensity: Controls how bright the background appears
- * - backgroundBlurriness: Controls how blurry/defocused the background is
- * - Is memoized to prevent unnecessary re-renders
- * 
- * @param intensity - Background brightness (0 = black, 1 = full brightness, default: 1.0)
- * @param blur - Background blur amount (0 = sharp, 1 = very blurry, default: 0.8)
- */
+/** Controls the intensity and blur of the environment background. */
 const BackgroundTune = memo(function BackgroundTune({ intensity = 1, blur = 0.8 }: { intensity?: number; blur?: number }) {
   const { scene } = useThree();
-  
+
   useEffect(() => {
     const s = scene as SceneWithBg;
     const pi = s.backgroundIntensity;
     const pb = s.backgroundBlurriness;
     s.backgroundIntensity = intensity;
     s.backgroundBlurriness = blur;
-    
     return () => {
       s.backgroundIntensity = pi ?? 1;
       s.backgroundBlurriness = pb ?? 0;
     };
   }, [scene, intensity, blur]);
-  
+
   return null;
 });
 
 /**
- * SmartOrbitControls - OrbitControls with demand frameloop integration.
- * 
- * This component ensures auto-rotate never freezes by:
- * - Continuously invalidating frames when auto-rotating
- * - Handling camera changes during user interaction
- * - Using requestAnimationFrame loop for smooth auto-rotation
+ * OrbitControls wrapper.
+ *
+ * Auto-rotation needs a continuous render loop, which is provided by the
+ * Canvas `frameloop="always"` (gated by viewport visibility in the parent).
+ * drei's OrbitControls updates damping/auto-rotate inside its own useFrame,
+ * so no manual requestAnimationFrame/invalidate loop is required here.
  */
 const SmartOrbitControls = memo(function SmartOrbitControls() {
-  const controlsRef = useRef<React.ElementRef<typeof OrbitControls>>(null);
-  const { invalidate } = useThree();
-  const rafRef = useRef<number | null>(null);
   const [isMobile, setIsMobile] = useState(false);
 
   useEffect(() => {
-    // Detect mobile device
-    setIsMobile(window.innerWidth < 768);
-    const handleResize = () => setIsMobile(window.innerWidth < 768);
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
+    const update = () => setIsMobile(window.innerWidth < 768);
+    update();
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
   }, []);
-
-  useEffect(() => {
-    const controls = controlsRef.current;
-    if (!controls) return;
-
-    // Continuously invalidate frames for auto-rotate
-    // This prevents auto-rotate from freezing with frameloop="demand"
-    const loop = () => {
-      invalidate();
-      rafRef.current = requestAnimationFrame(loop);
-    };
-    rafRef.current = requestAnimationFrame(loop);
-
-    // Also invalidate on change for immediate user interaction response
-    const handleChange = () => {
-      invalidate();
-    };
-
-    controls.addEventListener('change', handleChange);
-
-    return () => {
-      controls.removeEventListener('change', handleChange);
-      if (rafRef.current) {
-        cancelAnimationFrame(rafRef.current);
-      }
-    };
-  }, [invalidate]);
 
   return (
     <OrbitControls
-      ref={controlsRef}
       enableDamping
       dampingFactor={0.1}
       enablePan={false}
@@ -366,7 +220,7 @@ const SmartOrbitControls = memo(function SmartOrbitControls() {
       minDistance={isMobile ? 4 : undefined}
       maxDistance={isMobile ? 10 : undefined}
       autoRotate
-      autoRotateSpeed={2}
+      autoRotateSpeed={1}
       target={[0, 0, 0]}
       minAzimuthAngle={-Infinity}
       maxAzimuthAngle={Infinity}
@@ -378,36 +232,9 @@ const SmartOrbitControls = memo(function SmartOrbitControls() {
 });
 
 /**
- * FrameInvalidator - Keeps the canvas updating when needed.
- * 
- * With frameloop="demand", we only render when something changes.
- * This component ensures smooth animation by invalidating frames
- * when controls are active or auto-rotating.
- */
-function FrameInvalidator() {
-  const { invalidate } = useThree();
-  
-  useEffect(() => {
-    // Invalidate on mount to ensure initial render
-    invalidate();
-  }, [invalidate]);
-  
-  return null;
-}
-
-
-/**
  * ============================================================================
  * MESH & MATERIAL CATALOGS
  * ============================================================================
- * These arrays define the available 3D models and material presets.
- */
-
-/**
- * MESHES - Array of available 3D objects.
- * 
- * - First 5 items (indices 0-4) are GLB/GLTF model files
- * - Remaining items (indices 5-9) are procedural Three.js geometries
  */
 const MESHES = [
   { name: 'Mother Earth', glb: '/glb1.glb' },
@@ -422,249 +249,353 @@ const MESHES = [
   { name: 'Cylinder' },
 ];
 
-/**
- * MATERIALS - Array of material presets with different properties.
- * 
- * Each material defines physical properties:
- * - metalness: How metallic the surface is (0 = dielectric, 1 = metal)
- * - roughness: Surface roughness (0 = mirror smooth, 1 = completely rough)
- * - ior: Index of Refraction for glass/transparent materials (1.5 = typical glass)
- * - transmission: Transparency through the material (0 = opaque, 1 = transparent)
- * - thickness: Virtual thickness for transparent materials
- * - clearcoat: Extra glossy layer on top (like car paint)
- * - clearcoatRoughness: Roughness of the clearcoat layer
- * 
- * First 9 materials have texture maps (mapUrl), rest use solid colors.
- */
+// Shared clay normal map (4K). Spaces in the filename are URL-encoded so the
+// browser fetch resolves. Used by both clay materials (gray + brown).
+const CLAY_NRM = '/clay/Clay%20base%20broad%20strokes_4K_NRM.jpg';
+
+// >>> Clay bump (normal) strength — TUNE THIS. Single source of truth for BOTH
+// the "Clay" (brown) and "Clay Gray" materials. Higher = deeper relief.
+// (was 0.7 which read too strong; lower it further toward 0 to soften.)
+const CLAY_BUMP = 0.025;
+
 const MATERIALS = [
   // Textured materials (with image maps)
-  { name: 'Texture 1', base: { metalness: 0.0, roughness: 0.2, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 }, mapUrl: '/texture1.jpg' },
-  { name: 'Texture 2', base: { metalness: 0.2, roughness: 0.2, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 }, mapUrl: '/texture2.jpg' },
-  { name: 'Texture 3', base: { metalness: 0.0, roughness: 0.2, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0.1, clearcoatRoughness: 0.2 }, mapUrl: '/texture3.jpg' },
-  { name: 'Texture 4', base: { metalness: 0.6, roughness: 0.2, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0.2, clearcoatRoughness: 0.3 }, mapUrl: '/texture4.jpg' },
-  { name: 'Texture 5', base: { metalness: 0.0, roughness: 0.2, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 }, mapUrl: '/texture5.jpg' },
-  { name: 'Texture 6', base: { metalness: 0.0, roughness: 0.2, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 }, mapUrl: '/texture6.jpg' },
-  { name: 'Texture 7', base: { metalness: 0.0, roughness: 0.2, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 }, mapUrl: '/texture7.jpg' },
-  { name: 'Texture 8', base: { metalness: 0.0, roughness: 0.2, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 }, mapUrl: '/texture8.jpg' },
-  { name: 'Texture 9', base: { metalness: 0.0, roughness: 0.2, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 }, mapUrl: '/texture9.jpg' },
+  { name: 'Texture 1', base: { metalness: 0.0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0.2 }, mapUrl: '/texture1.jpg' },
+  { name: 'Texture 2', base: { metalness: 0.2, roughness: 0.3, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 }, mapUrl: '/texture2.jpg' },
+  { name: 'Texture 3', base: { metalness: 0.0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0.2 }, mapUrl: '/texture3.jpg' },
+  { name: 'Texture 4', base: { metalness: 0.6, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0.3 }, mapUrl: '/texture4.jpg' },
+  { name: 'Texture 5', base: { metalness: 0.0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0 }, mapUrl: '/texture5.jpg' },
+  { name: 'Texture 6', base: { metalness: 0.0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0 }, mapUrl: '/texture6.jpg' },
+  { name: 'Texture 7', base: { metalness: 0.0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 }, mapUrl: '/texture7.jpg' },
+  { name: 'Texture 8', base: { metalness: 0.0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0 }, mapUrl: '/texture8.jpg' },
+  { name: 'Texture 9', base: { metalness: 0.0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0 }, mapUrl: '/texture9.jpg' },
 
-  // Solid color materials
-  { name: 'Default', base: { color: '#8976b8', metalness: 0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 } },
-  { name: 'Metal', base: { color: '#c0c0c0', metalness: 1, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 } },
-  { name: 'Glass', base: { color: '#ffffff', metalness: 0, roughness: 0.1, ior: 1.5, transmission: 1, thickness: 1, clearcoat: 0, clearcoatRoughness: 0 } },
-  { name: 'Rough', base: { color: '#8ec78f', metalness: 0, roughness: 0.9, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 } },
-  { name: 'Chrome', base: { color: '#ffffff', metalness: 1, roughness: 0.0, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 } },
+  // Solid color materials. The pastel nature swatches share the Default
+  // material's glossy ceramic finish (roughness 0.1 + clearcoat) on a
+  // low-saturation natural palette (purple, wine, dark green, sage, dusty blue,
+  // blush). The two clay materials instead use a matte finish with the shared
+  // clay normal map for surface relief.
+  { name: 'Default', base: { color: '#8976b8', metalness: 0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0.2 } },
+  { name: 'Lavender', base: { color: '#b1a3cf', metalness: 0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0.2 } },
+  { name: 'Wine', base: { color: '#96687a', metalness: 0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0.2 } },
+  { name: 'Forest', base: { color: '#5f7a63', metalness: 0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0.2 } },
+  { name: 'Sage', base: { color: '#9fb39a', metalness: 0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0.2 } },
+  { name: 'Mist', base: { color: '#9bb2c4', metalness: 0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0.2 } },
+  { name: 'Blush', base: { color: '#c19a8c', metalness: 0, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 1, clearcoatRoughness: 0.2 } },
+  // The two clay materials sit next to each other in the grid and share the
+  // clay normal map. Their bump strength comes from the CLAY_BUMP constant above.
+  { name: 'Clay', base: { color: '#c8b79e', metalness: 0, roughness: 0.4, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 }, normalUrl: CLAY_NRM, bump: CLAY_BUMP },
+  { name: 'Clay Gray', base: { color: '#666666', metalness: 0, roughness: 0.4, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 }, normalUrl: CLAY_NRM, bump: CLAY_BUMP },
+  { name: 'Glass', base: { color: '#ffffff', metalness: 0, roughness: 0.1, ior: 1.5, transmission: 1, thickness: 1, clearcoat: 0, clearcoatRoughness: 0 }, thumb: 'radial-gradient(circle at 32% 28%, rgba(255,255,255,0.95), rgba(186,214,232,0.55) 55%, rgba(120,150,180,0.7))' },
+  { name: 'Chrome', base: { color: '#ffffff', metalness: 1, roughness: 0.1, ior: 1.5, transmission: 0, thickness: 0, clearcoat: 0, clearcoatRoughness: 0 }, thumb: 'linear-gradient(135deg, #eceef2 0%, #b9bdc6 22%, #f6f7f9 48%, #9aa1aa 72%, #d9dce1 100%)' },
 ];
 
-/**
- * ============================================================================
- * WEBGL TRIPLANAR TEXTURE MAPPING
- * ============================================================================
- * Triplanar mapping applies textures to complex 3D models without UVs.
- * It projects the texture from 3 directions (X, Y, Z) and blends them.
- * Only used for WebGL (WebGPU uses a different approach with box projection).
- */
-/**
- * TypeScript type for triplanar mapping shader uniforms.
- * These values are passed to the custom shader for texture projection.
- */
-type TriUniforms = {
-  triMap: { value: THREE.Texture | null };      // The texture to project
-  triScale: { value: number };                   // Texture tiling/scaling
-  triSharp: { value: number };                   // Blend sharpness between projections
-  triPivot: { value: THREE.Vector3 };           // Center point for projection
+// Module-level texture cache shared across the app. Each URL is loaded once and
+// the resulting THREE.Texture is reused, so switching back to a material is
+// instant and — crucially — the liquid morph blends into a texture that is
+// already resident instead of a stale one that finishes loading after the
+// animation ends. `getCachedTexture` resolves synchronously from cache when the
+// texture is already present.
+const _texCache = new Map<string, THREE.Texture>();
+
+function getCachedTexture(url: string, isNormal: boolean): Promise<THREE.Texture> {
+  const cached = _texCache.get(url);
+  if (cached) return Promise.resolve(cached);
+  return new Promise<THREE.Texture>((resolve, reject) => {
+    new THREE.TextureLoader().load(
+      url,
+      (t) => {
+        // Normal maps are data (linear); albedo maps are color (sRGB).
+        t.colorSpace = isNormal ? THREE.NoColorSpace : THREE.SRGBColorSpace;
+        t.wrapS = t.wrapT = THREE.RepeatWrapping;
+        t.minFilter = THREE.LinearMipmapLinearFilter;
+        t.magFilter = THREE.LinearFilter;
+        t.anisotropy = isNormal ? 8 : 16;
+        t.needsUpdate = true;
+        _texCache.set(url, t);
+        resolve(t);
+      },
+      undefined,
+      reject,
+    );
+  });
+}
+
+// Live triplanar sampler. The stock three `triplanarTexture` helper reads
+// `node.value` once at graph-build time and bakes that exact texture object
+// into the shader, so swapping our morph node's `.value` afterwards has no
+// effect (every material would keep showing whatever was bound at first
+// compile). Instead we sample our PERSISTENT TextureNode three times via
+// `.sample(uv)` — each clone keeps a live reference to the base node, so
+// updating `texNode.value` re-binds all three samples. Returns a vec4.
+function triplanarLive(texNode: TSLNode, scale: TSLNode, posNode: TSLNode, normalNode: TSLNode): TSLNode {
+  const bfRaw: TSLNode = normalNode.abs().normalize();
+  const bf: TSLNode = bfRaw.div(bfRaw.dot(vec3(1.0)));
+  const tx: TSLNode = posNode.yz.mul(scale);
+  const ty: TSLNode = posNode.zx.mul(scale);
+  const tz: TSLNode = posNode.xy.mul(scale);
+  const cx: TSLNode = texNode.sample(tx).mul(bf.x);
+  const cy: TSLNode = texNode.sample(ty).mul(bf.y);
+  const cz: TSLNode = texNode.sample(tz).mul(bf.z);
+  return cx.add(cy).add(cz);
+}
+
+// A loosely-typed TSL node (uniform / expression). The node graph is built once;
+// we only mutate `.value` on the uniforms at runtime.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type TSLNode = any;
+
+// 1×1 white pixel used as the initial texture for the from/to texture nodes,
+// before any real material texture has loaded. Shared across all instances.
+const WHITE_PIXEL = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+WHITE_PIXEL.colorSpace = THREE.SRGBColorSpace;
+WHITE_PIXEL.needsUpdate = true;
+
+// The subset of MeshPhysical scalar params that the liquid transition does NOT
+// blend in the node graph (transmission/clearcoat/ior). They are snapped at the
+// midpoint of the morph instead. Color, roughness and metalness ARE node-blended.
+type MaterialScalars = {
+  transmission: number;
+  thickness: number;
+  clearcoat: number;
+  clearcoatRoughness: number;
+  ior: number;
 };
 
-/**
- * Extended material type that includes triplanar uniforms in userData.
- */
-type MaterialWithTri = THREE.MeshPhysicalMaterial & {
-  userData: THREE.MeshPhysicalMaterial['userData'] & { triUniforms?: TriUniforms };
-};
+function computeScalars(
+  params: THREE.MeshPhysicalMaterialParameters & { color?: string },
+): MaterialScalars {
+  const EPS = 0.02;
+  return {
+    transmission: (params.transmission ?? 0) > EPS ? (params.transmission as number) : 0,
+    thickness: (params.thickness ?? 0) > EPS ? (params.thickness as number) : 0,
+    clearcoat: (params.clearcoat ?? 0) > EPS ? (params.clearcoat as number) : 0,
+    clearcoatRoughness: params.clearcoatRoughness ?? 0,
+    ior: params.ior ?? 1.5,
+  };
+}
+
+function applyScalars(m: THREE.MeshPhysicalNodeMaterial, s: MaterialScalars) {
+  m.transmission = s.transmission;
+  m.thickness = s.thickness;
+  m.clearcoat = s.clearcoat;
+  m.clearcoatRoughness = s.clearcoatRoughness;
+  m.ior = s.ior;
+}
+
+// Smooth ease for the liquid sweep so it accelerates then settles.
+function easeInOutCubic(t: number): number {
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+// Duration of the material liquid transition, in seconds.
+const MORPH_DURATION = 0.9;
+
+// ============================================================================
+// SCENE TUNABLES — edit these to position the sun + ocean
+// ============================================================================
+// Ocean surface height (world Y). Tweak this single value to find the right
+// waterline relative to the model; the SkyOcean call below uses it.
+const OCEAN_Y = -1.5;
+
+// Tone-mapping exposure. Kept low to match the analytic sky/ocean reference;
+// note it dims EVERYTHING, including the HDR ambient (raise ENV_INTENSITY to
+// compensate rather than this, unless you want the sky/ocean brighter too).
+const SCENE_EXPOSURE = 0.6;
+
+// Sunset-HDR ambient + reflection brightness on the model. Because exposure is
+// low, this is boosted so the HDR lighting/reflections read well. Raise it if
+// the model still looks too dark, lower it if reflections blow out (try 0.6–4).
+const ENV_INTENSITY = 0.6;
+
+// Sun control's DEFAULT knob position — the single source of truth that drives
+// BOTH the UI knob and the scene sun, so they always agree. dayAngle is 0..180
+// along the arc (0 = right/sunset horizon, 90 = noon apex, 180 = left/dawn
+// horizon). 45 ≈ 3:00 pm on the afternoon side; scene elevation is DERIVED.
+const DEFAULT_DAY_ANGLE = 15; // 5:00 pm on the afternoon arc
+const DEFAULT_SUN_AZIMUTH = 0; // rotation slider fully to the left
 
 /**
- * applyTriplanar - Modifies a material's shader to use triplanar texture mapping.
- * 
- * How triplanar mapping works:
- * 1. Project the texture from 3 directions (X, Y, Z axes)
- * 2. Sample the texture 3 times based on world position
- * 3. Blend the 3 samples based on surface normal direction
- * 
- * Benefits:
- * - Works on any geometry without UV coordinates
- * - No texture stretching or distortion
- * - Automatic texture alignment
- * 
- * This function injects custom GLSL code into Three.js's shader at specific points.
- * 
- * @param material - The material to modify with triplanar mapping
+ * ============================================================================
+ * SKY + OCEAN (WebGPU)
+ * ============================================================================
+ * Analytic daytime sky (SkyMesh, with volumetric clouds) plus a flat, reflective
+ * ocean (WaterMesh, which uses a planar reflector). Replaces the old floor disc.
+ *
+ * The model's ambient lighting + reflections come from the sunset HDR
+ * environment (see the <Environment> in ThreeCanvas); the ocean reflects the
+ * analytic sky via its own planar reflector. Both meshes rely on the
+ * auto-advancing TSL `time` node, so the water animates automatically every
+ * rendered frame — no manual per-frame uniform updates.
+ *
+ * The meshes are built once and the sun direction is updated imperatively when
+ * the sun control changes, so dragging the sun is cheap (uniform writes only).
  */
-function applyTriplanar(material: MaterialWithTri) {
-  material.userData.triUniforms ??= {
-    triMap: { value: null },
-    triScale: { value: 1.0 },
-    triSharp: { value: 2.0 },
-    triPivot: { value: new THREE.Vector3() },
-  };
-  material.onBeforeCompile = (shader) => {
-    shader.vertexShader = shader.vertexShader
-      .replace(
-        '#include <common>',
-        `
-        #include <common>
-        varying vec3 vWPos;
-        varying vec3 vWNorm;
-      `,
-      )
-      .replace(
-        '#include <beginnormal_vertex>',
-        `
-        #include <beginnormal_vertex>
-        vWNorm = normalize(mat3(modelMatrix) * objectNormal);
-      `,
-      )
-      .replace(
-        '#include <begin_vertex>',
-        `
-        #include <begin_vertex>
-        vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
-      `,
-      );
-    shader.fragmentShader = shader.fragmentShader
-      .replace(
-        '#include <map_pars_fragment>',
-        `
-        #include <map_pars_fragment>
-        varying vec3 vWPos;
-        varying vec3 vWNorm;
-        uniform sampler2D triMap;
-        uniform float triScale;
-        uniform float triSharp;
-        uniform vec3  triPivot;
-        vec3 triBlend(vec3 n) {
-          vec3 an = abs(n);
-          an = pow(an, vec3(triSharp));
-          return an / (an.x + an.y + an.z + 1e-5);
-        }
-        vec4 triSample(vec3 p, vec3 n){
-          vec3 pc = (p - triPivot);
-          vec3 an = abs(normalize(n));
-          if (an.x > an.y && an.x > an.z) {
-            vec2 uv = fract(pc.zy * triScale + 0.5);
-            return texture2D(triMap, uv);
-          } else if (an.y > an.z) {
-            vec2 uv = fract(pc.xz * triScale + 0.5);
-            return texture2D(triMap, uv);
-          } else {
-            vec2 uv = fract(pc.xy * triScale + 0.5);
-            return texture2D(triMap, uv);
-          }
-        }
-      `,
-      )
-      .replace(
-        '#include <map_fragment>',
-        `
-        vec4 sampledDiffuseColor = triSample(vWPos, vWNorm);
-        diffuseColor *= sampledDiffuseColor;
-      `,
-      );
-    shader.uniforms.triMap = material.userData.triUniforms!.triMap;
-    shader.uniforms.triScale = material.userData.triUniforms!.triScale;
-    shader.uniforms.triSharp = material.userData.triUniforms!.triSharp;
-    shader.uniforms.triPivot = material.userData.triUniforms!.triPivot;
-  };
-  material.needsUpdate = true;
+function SkyOcean({
+  sunDirection,
+  oceanY = -0.0,
+  exposure = 0.1,
+}: {
+  sunDirection: [number, number, number];
+  oceanY?: number;
+  exposure?: number;
+}) {
+  const { scene, gl, invalidate } = useThree();
+  const skyRef = useRef<SkyMesh | null>(null);
+  const waterRef = useRef<WaterMesh | null>(null);
+
+  // Build the sky + ocean once.
+  useEffect(() => {
+    const sky = new SkyMesh();
+    sky.scale.setScalar(10000);
+    sky.turbidity.value = 10;
+    sky.rayleigh.value = 2;
+    sky.mieCoefficient.value = 0.005;
+    sky.mieDirectionalG.value = 0.8;
+    sky.cloudCoverage.value = 0.4;
+    sky.cloudDensity.value = 0.5;
+    sky.cloudElevation.value = 0.5;
+    scene.add(sky);
+    skyRef.current = sky;
+
+    const waterNormals = new THREE.TextureLoader().load('/waternormals.jpg', (t) => {
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    });
+    const water = new WaterMesh(new THREE.PlaneGeometry(10000, 10000), {
+      waterNormals,
+      sunColor: 0xffffff,
+      waterColor: 0x001e0f,
+      distortionScale: 3.7,
+      size: 1,
+    });
+    water.rotation.x = -Math.PI / 2;
+    water.position.y = oceanY;
+    scene.add(water);
+    waterRef.current = water;
+
+    invalidate();
+
+    return () => {
+      scene.remove(sky);
+      scene.remove(water);
+      (sky.material as THREE.Material).dispose();
+      (water.material as THREE.Material).dispose();
+      sky.geometry.dispose();
+      water.geometry.dispose();
+      waterNormals.dispose();
+      skyRef.current = null;
+      waterRef.current = null;
+    };
+  }, [scene, oceanY, invalidate]);
+
+  // Keep tone-mapping exposure in sync.
+  useEffect(() => {
+    (gl as AnyRenderer).toneMappingExposure = exposure;
+    invalidate();
+  }, [gl, exposure, invalidate]);
+
+  // Update the sun direction (shared by sky scattering + ocean specular) when
+  // the sun control changes — cheap uniform writes, no mesh re-creation.
+  //
+  // The analytic SkyMesh (Preetham daytime model) collapses to near-black when
+  // the sun sits exactly on the horizon (y = 0), so dawn/dusk looked dead. Two
+  // fixes here, both driven by the sun's elevation factor (the unit dir's y):
+  //   1. Pin the sun fractionally above the horizon so the sky keeps rendering
+  //      its rich orange/red scattering band instead of going black.
+  //   2. Blend the scattering + cloud + exposure uniforms toward a warm sunset
+  //      look as the sun approaches the horizon.
+  useEffect(() => {
+    const sky = skyRef.current;
+    const water = waterRef.current;
+    if (!sky || !water) return;
+    const [sx, sy, sz] = sunDirection;
+
+    // sy is the elevation factor (0 = horizon, 1 = zenith) since sunDirection
+    // is a unit vector. "horizon" is 1 at/below the horizon and fades to 0 once
+    // the sun climbs past ~18° (sin 18° ≈ 0.31) — the twilight/golden-hour band.
+    const horizon = THREE.MathUtils.clamp(1 - sy / 0.31, 0, 1);
+
+    // Keep the sun just above the horizon so the orange band never disappears.
+    const skyY = Math.max(sy, 0.05);
+    sky.sunPosition.value.set(sx, skyY, sz);
+    water.sunDirection.value.set(sx, skyY, sz).normalize();
+
+    // Warm, hazier, denser-scattering sky near the horizon for a redder sunset;
+    // calmer daytime values up high.
+    sky.turbidity.value = THREE.MathUtils.lerp(10, 14, horizon);
+    sky.rayleigh.value = THREE.MathUtils.lerp(2, 4, horizon);
+    sky.mieCoefficient.value = THREE.MathUtils.lerp(0.005, 0.009, horizon);
+    sky.mieDirectionalG.value = THREE.MathUtils.lerp(0.8, 0.93, horizon);
+    // Thin the clouds at low sun so they don't read as black blotches.
+    sky.cloudCoverage.value = THREE.MathUtils.lerp(0.4, 0.3, horizon);
+    sky.cloudDensity.value = THREE.MathUtils.lerp(0.5, 0.22, horizon);
+
+    // Lift exposure as the sky dims toward dusk so it stays luminous, not murky.
+    (gl as AnyRenderer).toneMappingExposure = THREE.MathUtils.lerp(
+      exposure,
+      exposure * 1.7,
+      horizon,
+    );
+
+    invalidate();
+  }, [sunDirection, exposure, gl, invalidate]);
+
+  return null;
+}
+
+/**
+ * Directional "sun" light that follows the same sun direction as the sky/ocean,
+ * so the model's key light + shadow track the SunControl. Updated imperatively
+ * (via ref) so dragging the sun never re-renders the memoized Scene.
+ */
+function SunLight({
+  sunDirection,
+  safeMode,
+  distance = 12,
+  intensity = 1.0,
+}: {
+  sunDirection: [number, number, number];
+  safeMode: boolean;
+  distance?: number;
+  intensity?: number;
+}) {
+  const lightRef = useRef<THREE.DirectionalLight>(null);
+  const { invalidate } = useThree();
+
+  useEffect(() => {
+    const l = lightRef.current;
+    if (!l) return;
+    const [sx, sy, sz] = sunDirection;
+    // Keep the light above the horizon so the model never goes fully dark.
+    l.position.set(sx * distance, Math.max(0.15, sy) * distance, sz * distance);
+    invalidate();
+  }, [sunDirection, distance, invalidate]);
+
+  return (
+    <directionalLight
+      ref={lightRef}
+      intensity={intensity}
+      castShadow={!safeMode}
+      shadow-mapSize-width={safeMode ? 512 : 1024}
+      shadow-mapSize-height={safeMode ? 512 : 1024}
+      shadow-camera-far={20}
+      shadow-camera-left={-10}
+      shadow-camera-right={10}
+      shadow-camera-top={10}
+      shadow-camera-bottom={-10}
+      shadow-bias={-0.0001}
+    />
+  );
 }
 
 /**
  * ============================================================================
- * WEBGPU BOX-PROJECTED UV GENERATION
+ * SCENE COMPONENT
  * ============================================================================
- * WebGPU doesn't support custom shaders like the triplanar approach.
- * Instead, we pre-generate UV coordinates using box projection.
- */
-
-/**
- * boxProjectUVsCentered - Generates UV coordinates using box projection.
- * 
- * Box projection works by:
- * 1. Finding the center and size of the object
- * 2. For each vertex, determining which axis it faces (X, Y, or Z)
- * 3. Projecting UV coordinates from that axis onto the vertex
- * 4. Centering coordinates around 0.5 to avoid texture seams
- * 
- * This creates proper UV coordinates for any geometry, similar to triplanar
- * but pre-computed instead of done in the shader.
- * 
- * @param geo - The geometry to generate UVs for
- * @param obj - The 3D object (for world transform)
- * @param pivotWS - Center point in world space
- * @param sizeRef - Reference size for normalization
- */
-function boxProjectUVsCentered(
-  geo: THREE.BufferGeometry,
-  obj: THREE.Object3D,
-  pivotWS: THREE.Vector3,
-  sizeRef: number,
-) {
-  if (!geo.attributes.position) return;
-  if (!geo.attributes.normal) geo.computeVertexNormals();
-
-  const pos = geo.attributes.position as THREE.BufferAttribute;
-  const norm = geo.attributes.normal as THREE.BufferAttribute;
-  const nMat = new THREE.Matrix3().getNormalMatrix(obj.matrixWorld);
-
-  const uvs = new Float32Array(pos.count * 2);
-
-  for (let i = 0; i < pos.count; i++) {
-    const wp = new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i)).applyMatrix4(obj.matrixWorld);
-    const wn = new THREE.Vector3(norm.getX(i), norm.getY(i), norm.getZ(i)).applyMatrix3(nMat).normalize();
-
-    const pc = wp.sub(pivotWS).divideScalar(sizeRef);
-
-    const nx = Math.abs(wn.x);
-    const ny = Math.abs(wn.y);
-    const nz = Math.abs(wn.z);
-
-    const uvX: [number, number] = [pc.z + 0.5, pc.y + 0.5];
-    const uvY: [number, number] = [pc.x + 0.5, pc.z + 0.5];
-    const uvZ: [number, number] = [pc.x + 0.5, pc.y + 0.5];
-
-    let axis: 'x' | 'y' | 'z' = 'x';
-    if (ny > nx && ny > nz) axis = 'y';
-    else if (nz > nx && nz > ny) axis = 'z';
-
-    const uvPick: [number, number] = axis === 'x' ? uvX : axis === 'y' ? uvY : uvZ;
-    const u = uvPick[0];
-    const v = uvPick[1];
-
-    uvs[2 * i] = u;
-    uvs[2 * i + 1] = v;
-  }
-
-  geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
-  (geo.attributes.uv as THREE.BufferAttribute).needsUpdate = true;
-}
-
-/**
- * ============================================================================
- * SCENE COMPONENT - Main 3D Scene with Model, Materials, and Lighting
- * ============================================================================
- * This is the core component that renders the 3D objects.
- * It handles:
- * - Loading and displaying 3D models (GLB files) or primitive shapes
- * - Applying and updating materials with textures
- * - Managing texture loading states
- * - Creating the floor with reflections
- * - Setting up lighting (ambient + directional + point lights)
- * - Generating proper UV coordinates for texturing
- * 
- * The component is memoized to prevent unnecessary re-renders when
- * parent state changes that don't affect the scene.
  */
 const Scene = memo(function Scene({
   meshIndex,
+  matIndex,
   params,
   envIntensity,
   safeMode,
@@ -674,6 +605,7 @@ const Scene = memo(function Scene({
   onReady,
 }: {
   meshIndex: number;
+  matIndex: number;
   params: THREE.MeshPhysicalMaterialParameters & { color?: string };
   envIntensity: number;
   safeMode: boolean;
@@ -684,246 +616,433 @@ const Scene = memo(function Scene({
 }) {
   const meshRef = useRef<THREE.Mesh>(null!);
   const groupRef = useRef<THREE.Group>(null!);
-  const [loadingGlb, setLoadingGlb] = useState(false);
   const readyNotifiedRef = useRef(false);
   const { invalidate } = useThree();
 
   // ticks when a GLB actually mounts so we can re-assign materials then
   const [glbMountTick, setGlbMountTick] = useState(0);
 
-  /* -------- Texture loading -------- */
-  const [tex, setTex] = useState<THREE.Texture | null>(null);
-  const [loadingTex, setLoadingTex] = useState(false);
-  const lastMapRef = useRef<string | undefined>(undefined);
+  /* -------- GLB selection -------- */
+  const meshDef = MESHES[meshIndex] as { name: string; glb?: string };
+  const isGLB = typeof meshDef?.glb === 'string';
+  const glbPath = isGLB ? (meshDef.glb as string) : '';
 
-  const whiteTex = React.useMemo(() => {
-    const data = new Uint8Array([255, 255, 255, 255]);
-    const t = new THREE.DataTexture(data, 1, 1);
-    t.colorSpace = THREE.SRGBColorSpace;
-    t.needsUpdate = true;
-    return t;
+  // Track which GLB path has finished mounting. Deriving the loading flag from
+  // this (instead of toggling state in effects) avoids a child/parent effect
+  // ordering race that left "Loading model..." stuck on screen forever.
+  const [loadedPath, setLoadedPath] = useState<string | null>(null);
+  const loadingGlb = isGLB && loadedPath !== glbPath;
+
+  // Stable callback fired once the GLB scene graph is mounted.
+  const handleGlbReady = useCallback(() => {
+    setGlbMountTick((t) => t + 1);
+    setLoadedPath(glbPath);
+  }, [glbPath]);
+
+  /* -------- Preload every material texture once (warms the cache so the
+     liquid morph always blends into a texture that is already resident). -------- */
+  useEffect(() => {
+    for (const m of MATERIALS) {
+      const mm = m as { mapUrl?: string; normalUrl?: string };
+      if (mm.mapUrl) getCachedTexture(mm.mapUrl, false).catch(() => {});
+      if (mm.normalUrl) getCachedTexture(mm.normalUrl, true).catch(() => {});
+    }
   }, []);
 
-  const applyTilingCentered = (t: THREE.Texture, scale: number) => {
-    t.wrapS = t.wrapT = THREE.RepeatWrapping;
-    t.center.set(0.5, 0.5);
-    t.repeat.set(scale, scale);
-    t.offset.set(0, 0);
-    t.needsUpdate = true;
-  };
+  /* -------- Spinner state for the current material's albedo texture. -------- */
+  // The actual textures used by the morph are resolved directly from the cache
+  // inside the transition effect below (not from React state) so there is no
+  // lag/race between a switch and which texture the morph reveals. This effect
+  // only drives the "Loading texture..." indicator + the ready notification.
+  const [loadingTex, setLoadingTex] = useState(false);
 
   useEffect(() => {
-    if (!mapUrl) {
-      lastMapRef.current = undefined;
+    if (!mapUrl || _texCache.get(mapUrl)) {
       setLoadingTex(false);
-      setTex(null);
       return;
     }
-    if (lastMapRef.current === mapUrl) return;
-    
     let alive = true;
     setLoadingTex(true);
-    
-    const loader = new THREE.TextureLoader();
-    loader.load(
-      mapUrl,
-      (t) => {
-        if (!alive) {
-          t.dispose();
-          return;
-        }
-        t.colorSpace = THREE.SRGBColorSpace;
-        t.minFilter = THREE.LinearMipmapLinearFilter;
-        t.magFilter = THREE.LinearFilter;
-        t.anisotropy = 16;
-        applyTilingCentered(t, triScale);
-        setTex(t);
-        lastMapRef.current = mapUrl;
-        setLoadingTex(false);
-      },
-      undefined,
-      () => {
+    getCachedTexture(mapUrl, false)
+      .then(() => {
         if (alive) setLoadingTex(false);
-      },
-    );
-    
+      })
+      .catch(() => {
+        if (alive) setLoadingTex(false);
+      });
     return () => {
       alive = false;
     };
-  }, [mapUrl, triScale]);
-
-  // Update tiling when triScale changes
-  useEffect(() => {
-    if (tex) applyTilingCentered(tex, triScale);
-  }, [tex, triScale]);
-
-  /* -------- GLB via useGLTF (no external loader) -------- */
-  const isGLB = meshIndex < 5;
-  const glbPath = isGLB ? (MESHES[meshIndex] as { glb: string }).glb : '';
-
-  // Track GLB loading state
-  useEffect(() => {
-    if (isGLB) {
-      setLoadingGlb(true);
-      readyNotifiedRef.current = false;
-    } else {
-      setLoadingGlb(false);
-      readyNotifiedRef.current = false;
-    }
-  }, [isGLB, meshIndex]);
+  }, [mapUrl]);
 
   // Notify parent when scene is ready (model loaded, no texture loading)
   useEffect(() => {
-    // Scene is ready when:
-    // 1. Model is not loading (GLB loaded or primitive ready)
-    // 2. Texture is not loading (either loaded or no texture)
     if (!loadingGlb && !loadingTex && !readyNotifiedRef.current) {
       readyNotifiedRef.current = true;
       onReady?.();
     }
   }, [loadingGlb, loadingTex, onReady]);
 
-  /* -------- Shared material -------- */
-  const sharedMatRef = useRef<THREE.MeshPhysicalMaterial | MaterialWithTri | null>(null);
-  if (!sharedMatRef.current) {
-    const m = new THREE.MeshPhysicalMaterial({
-      ...params,
-      color: params.color || '#ffffff',
-      envMapIntensity: envIntensity,
-    }) as THREE.MeshPhysicalMaterial;
+  /* -------- Shared WebGPU node material + liquid-transition graph -------- */
+  // The material's appearance is a node graph built ONCE that blends a "from"
+  // and a "to" appearance through an animated "liquid" mask. Switching material
+  // snapshots the current look into "from", sets the new look as "to", and
+  // animates `progress` 0→1 so the new material floods over the old one with a
+  // wavy front. Slider tweaks update "to" (and, while idle, mirror it into
+  // "from") so they apply instantly without a transition. Nothing here rebuilds
+  // the shader — we only mutate uniform `.value`s — so it stays cheap.
+  const sharedMatRef = useRef<THREE.MeshPhysicalNodeMaterial | null>(null);
+  const nodesRef = useRef<{
+    triScale: TSLNode;
+    pivot: TSLNode;
+    invSpanY: TSLNode;
+    progress: TSLNode;
+    fromColor: TSLNode;
+    toColor: TSLNode;
+    fromIsTex: TSLNode;
+    toIsTex: TSLNode;
+    fromRough: TSLNode;
+    toRough: TSLNode;
+    fromMetal: TSLNode;
+    toMetal: TSLNode;
+    fromTex: TSLNode;
+    toTex: TSLNode;
+    normalTex: TSLNode;
+    bump: TSLNode;
+  } | null>(null);
+  const morphRef = useRef<{
+    active: boolean;
+    t: number;
+    scalarsApplied: boolean;
+    targetScalars: MaterialScalars;
+  }>({ active: false, t: 0, scalarsApplied: true, targetScalars: computeScalars(params) });
+  const firstMatRunRef = useRef(true);
+  // Monotonic token so an async texture load from a superseded switch can't
+  // clobber the current target (rapid clicking through swatches).
+  const switchTokenRef = useRef(0);
 
-    if (!IS_WEBGPU) {
-      (m as MaterialWithTri).map = whiteTex;
-      applyTriplanar(m as MaterialWithTri);
-      (m as MaterialWithTri).userData.triUniforms!.triMap.value = whiteTex;
-    } else {
-      // For WebGPU, set initial texture if available
-      if (tex) {
-        m.map = tex;
-      }
-    }
-    sharedMatRef.current = m;
+  if (!nodesRef.current) {
+    const initColor = (params.color as string) || '#ffffff';
+    const initIsTex = mapUrl ? 1 : 0;
+    nodesRef.current = {
+      triScale: uniform(triScale),
+      pivot: uniform(new THREE.Vector3()),
+      invSpanY: uniform(1),
+      progress: uniform(0),
+      fromColor: uniform(new THREE.Color(initColor)),
+      toColor: uniform(new THREE.Color(initColor)),
+      fromIsTex: uniform(initIsTex),
+      toIsTex: uniform(initIsTex),
+      fromRough: uniform(params.roughness ?? 0.5),
+      toRough: uniform(params.roughness ?? 0.5),
+      fromMetal: uniform(params.metalness ?? 0),
+      toMetal: uniform(params.metalness ?? 0),
+      fromTex: texture(WHITE_PIXEL),
+      toTex: texture(WHITE_PIXEL),
+      normalTex: texture(WHITE_PIXEL),
+      bump: uniform(0),
+    };
   }
 
-  /* -------- Material updates -------- */
+  if (!sharedMatRef.current) {
+    const n = nodesRef.current;
+    const m = new THREE.MeshPhysicalNodeMaterial();
+    m.envMapIntensity = envIntensity;
+
+    // Triplanar projection from world position (relative to the object's center)
+    // so textures map cleanly onto any geometry, even UV-less models. The graph
+    // locals are typed loosely (TSLNode) because the strict three/tsl overloads
+    // don't track our `any`-typed uniforms through the arithmetic below.
+    const pos = positionWorld as TSLNode;
+    const projPos: TSLNode = pos.sub(n.pivot);
+    const fromTexSample: TSLNode = triplanarLive(n.fromTex, n.triScale, projPos, normalWorld);
+    const toTexSample: TSLNode = triplanarLive(n.toTex, n.triScale, projPos, normalWorld);
+    // Each side is either a solid color or its triplanar texture, chosen by the
+    // isTex uniform (0 = color, 1 = texture) — no recompile when it changes.
+    const fromApp: TSLNode = mix(n.fromColor, fromTexSample.rgb, n.fromIsTex);
+    const toApp: TSLNode = mix(n.toColor, toTexSample.rgb, n.toIsTex);
+
+    // Liquid mask: a wavy front floods top→bottom as progress goes 0→1. `h` is
+    // the object-normalised height [0..1]; using (1 - h) makes the new material
+    // appear at the top first and run down. Two sine waves wobble the front so
+    // it reads like a liquid surface rather than a straight wipe.
+    const local: TSLNode = pos.sub(n.pivot);
+    const h: TSLNode = clamp(local.y.mul(n.invSpanY).add(0.5), 0, 1);
+    const wobble: TSLNode = sin(local.x.mul(7.0).add(n.progress.mul(6.2)))
+      .add(sin(local.z.mul(5.0).add(n.progress.mul(4.5))))
+      .mul(0.06);
+    const coord: TSLNode = h.oneMinus().add(wobble);
+    const front: TSLNode = n.progress.mul(1.52).sub(0.26);
+    // mask = 1 below the front (new material), 0 above (old material).
+    const mask: TSLNode = smoothstep(front.sub(0.12), front.add(0.12), coord).oneMinus();
+
+    m.colorNode = mix(fromApp, toApp, mask);
+    m.roughnessNode = mix(n.fromRough, n.toRough, mask);
+    m.metalnessNode = mix(n.fromMetal, n.toMetal, mask);
+
+    // Triplanar bump (normal) mapping for the clay materials. Because the meshes
+    // have no UVs or tangents, we can't use the standard tangent-space normalMap
+    // node; instead we perturb the view normal from screen-space derivatives of
+    // a triplanar-sampled height (Mikkelsen's unparametrized-surface method, the
+    // same approach three's bumpMap uses). The clay normal map's green channel is
+    // used as the height signal. When `bump` is 0 (all non-clay materials) the
+    // gradient vanishes and this returns the unperturbed geometric normal.
+    const heightSample: TSLNode = triplanarLive(n.normalTex, n.triScale, projPos, normalWorld);
+    const height: TSLNode = heightSample.g;
+    const dHx: TSLNode = height.dFdx().mul(n.bump);
+    const dHy: TSLNode = height.dFdy().mul(n.bump);
+    const sigX: TSLNode = positionView.dFdx();
+    const sigY: TSLNode = positionView.dFdy();
+    const vN: TSLNode = normalView;
+    const R1: TSLNode = sigY.cross(vN);
+    const R2: TSLNode = vN.cross(sigX);
+    const fDet: TSLNode = sigX.dot(R1);
+    const vGrad: TSLNode = R1.mul(dHx).add(R2.mul(dHy)).mul(fDet.sign());
+    m.normalNode = vN.mul(fDet.abs()).sub(vGrad).normalize();
+
+    sharedMatRef.current = m;
+    applyScalars(m, computeScalars(params));
+  }
+
+  /* -------- Trigger a liquid transition on material switch -------- */
+  // The morph endpoints are resolved DETERMINISTICALLY from the selected
+  // material definition + the texture cache here — never from the lagging
+  // `params`/`tex` React state — so the texture the morph reveals is always the
+  // one for the swatch that was clicked, with no mid/post-transition flips.
+  useEffect(() => {
+    const n = nodesRef.current;
+    const m = sharedMatRef.current;
+    if (!n || !m) return;
+
+    const mat = MATERIALS[matIndex] as {
+      base: THREE.MeshPhysicalMaterialParameters & { color?: string };
+      mapUrl?: string;
+      normalUrl?: string;
+      bump?: number;
+    };
+    const base = mat.base;
+    const first = firstMatRunRef.current;
+
+    // 1. Snapshot the currently displayed look into "from" (skipped on the very
+    //    first run, where there is nothing to transition from).
+    if (!first) {
+      n.fromColor.value.copy(n.toColor.value);
+      n.fromRough.value = n.toRough.value;
+      n.fromMetal.value = n.toMetal.value;
+      n.fromIsTex.value = n.toIsTex.value;
+      n.fromTex.value = n.toTex.value;
+    }
+
+    // 2. Resolve the NEW material's "to" appearance straight from its definition.
+    if (base.color) n.toColor.value.set(base.color as string);
+    n.toRough.value = base.roughness ?? 0.5;
+    n.toMetal.value = base.metalness ?? 0;
+
+    const token = ++switchTokenRef.current;
+
+    // Albedo: bind from cache synchronously when warm; otherwise show the solid
+    // color until it loads, then bind it (guarded by `token` against a newer
+    // switch superseding this one).
+    if (mat.mapUrl) {
+      const cached = _texCache.get(mat.mapUrl);
+      if (cached) {
+        n.toTex.value = cached;
+        n.toIsTex.value = 1;
+      } else {
+        n.toIsTex.value = 0;
+        getCachedTexture(mat.mapUrl, false)
+          .then((t) => {
+            if (switchTokenRef.current !== token) return;
+            n.toTex.value = t;
+            n.toIsTex.value = 1;
+            if (!morphRef.current.active) {
+              n.fromTex.value = t;
+              n.fromIsTex.value = 1;
+            }
+            invalidate();
+          })
+          .catch(() => {});
+      }
+    } else {
+      n.toIsTex.value = 0;
+    }
+
+    // Normal/bump (surface detail, not blended through the mask).
+    if (mat.normalUrl) {
+      const strength = mat.bump ?? 0;
+      const cachedN = _texCache.get(mat.normalUrl);
+      if (cachedN) {
+        n.normalTex.value = cachedN;
+        n.bump.value = strength;
+      } else {
+        n.bump.value = 0;
+        getCachedTexture(mat.normalUrl, true)
+          .then((t) => {
+            if (switchTokenRef.current !== token) return;
+            n.normalTex.value = t;
+            n.bump.value = strength;
+            invalidate();
+          })
+          .catch(() => {});
+      }
+    } else {
+      n.bump.value = 0;
+    }
+
+    morphRef.current.targetScalars = computeScalars(base);
+
+    if (first) {
+      // First mount: no animation — mirror "to" into "from" and apply scalars now.
+      firstMatRunRef.current = false;
+      n.fromColor.value.copy(n.toColor.value);
+      n.fromRough.value = n.toRough.value;
+      n.fromMetal.value = n.toMetal.value;
+      n.fromIsTex.value = n.toIsTex.value;
+      n.fromTex.value = n.toTex.value;
+      applyScalars(m, morphRef.current.targetScalars);
+    } else {
+      morphRef.current.active = true;
+      morphRef.current.t = 0;
+      morphRef.current.scalarsApplied = false;
+      n.progress.value = 0;
+    }
+    invalidate();
+  }, [matIndex, invalidate]);
+
+  /* -------- Live slider/scalar tweaks (no texture state here) -------- */
+  // Handles user edits to the color/roughness/metalness/scalar sliders and the
+  // texture-scale + env-intensity values for the CURRENT material. Textures are
+  // owned by the transition effect above, so this never touches them.
   useEffect(() => {
     const m = sharedMatRef.current;
-    if (!m) return;
+    const n = nodesRef.current;
+    if (!m || !n) return;
 
-    const EPS = 0.02;
-    const transmission = (params.transmission ?? 0) > EPS ? (params.transmission as number) : 0;
-    const thickness = (params.thickness ?? 0) > EPS ? (params.thickness as number) : 0;
-    const clearcoat = (params.clearcoat ?? 0) > EPS ? (params.clearcoat as number) : 0;
+    if (params.color) n.toColor.value.set(params.color as string);
+    n.toRough.value = params.roughness ?? 0.5;
+    n.toMetal.value = params.metalness ?? 0;
+    n.triScale.value = triScale;
+    if (m.envMapIntensity !== envIntensity) m.envMapIntensity = envIntensity;
 
-    // Batch all updates together
-    (m as THREE.MeshPhysicalMaterial).roughness = params.roughness ?? 0.5;
-    (m as THREE.MeshPhysicalMaterial).metalness = params.metalness ?? 0;
-    (m as THREE.MeshPhysicalMaterial).ior = params.ior ?? 1.5;
-    (m as THREE.MeshPhysicalMaterial).transmission = transmission;
-    (m as THREE.MeshPhysicalMaterial).thickness = thickness;
-    (m as THREE.MeshPhysicalMaterial).clearcoat = clearcoat;
-    (m as THREE.MeshPhysicalMaterial).clearcoatRoughness = params.clearcoatRoughness ?? 0;
-    
-    // Keep envMapIntensity constant
-    if ((m as THREE.MeshPhysicalMaterial).envMapIntensity !== envIntensity) {
-      (m as THREE.MeshPhysicalMaterial).envMapIntensity = envIntensity;
+    const target = computeScalars(params);
+    morphRef.current.targetScalars = target;
+
+    // When idle (slider tweak, not a transition), mirror "to" into "from" so the
+    // at-rest display updates immediately, and apply the scalar PBR params now.
+    if (!morphRef.current.active) {
+      n.fromColor.value.copy(n.toColor.value);
+      n.fromRough.value = n.toRough.value;
+      n.fromMetal.value = n.toMetal.value;
+      n.fromIsTex.value = n.toIsTex.value;
+      n.fromTex.value = n.toTex.value;
+      applyScalars(m, target);
     }
 
-    const hasTex = !!(mapUrl && tex);
-    if (IS_WEBGPU) {
-      (m as THREE.MeshPhysicalMaterial).map = hasTex ? tex! : null;
-      if (hasTex) (m as THREE.MeshPhysicalMaterial).color.set('#ffffff');
-      else if (params.color) (m as THREE.MeshPhysicalMaterial).color.set(params.color as string);
-      (m as THREE.MeshPhysicalMaterial).needsUpdate = true;
-    } else {
-      const tri = (m as MaterialWithTri).userData.triUniforms!;
-      tri.triMap.value = hasTex ? tex! : whiteTex;
-      tri.triScale.value = triScale;
-      if (mapUrl) (m as THREE.MeshPhysicalMaterial).color.set('#ffffff');
-      else if (params.color) (m as THREE.MeshPhysicalMaterial).color.set(params.color as string);
-    }
-
-    // Trigger re-render with demand frameloop
     invalidate();
-  }, [params, envIntensity, tex, mapUrl, whiteTex, triScale, invalidate]);
+  }, [params, envIntensity, triScale, invalidate]);
 
-  /* -------- Assign material + generate centered UVs for WebGPU -------- */
+  /* -------- Advance the liquid transition each frame -------- */
+  useFrame((_, delta) => {
+    const mo = morphRef.current;
+    const n = nodesRef.current;
+    const m = sharedMatRef.current;
+    if (!mo.active || !n || !m) return;
+
+    mo.t = Math.min(1, mo.t + delta / MORPH_DURATION);
+    n.progress.value = easeInOutCubic(mo.t);
+
+    // Snap the non-blended scalar PBR params (transmission/clearcoat/ior) at the
+    // midpoint, when the flood front is roughly halfway across the object.
+    if (!mo.scalarsApplied && mo.t >= 0.5) {
+      applyScalars(m, mo.targetScalars);
+      mo.scalarsApplied = true;
+    }
+
+    if (mo.t >= 1) {
+      mo.active = false;
+      // Fold "to" into "from" and reset progress so the at-rest display equals
+      // the new material, ready for the next switch.
+      n.fromColor.value.copy(n.toColor.value);
+      n.fromRough.value = n.toRough.value;
+      n.fromMetal.value = n.toMetal.value;
+      n.fromIsTex.value = n.toIsTex.value;
+      n.fromTex.value = n.toTex.value;
+      n.progress.value = 0;
+      applyScalars(m, mo.targetScalars);
+    }
+
+    invalidate();
+  });
+
+  /* -------- Assign shared material to all meshes -------- */
   useEffect(() => {
-        const root = (isGLB ? groupRef.current : meshRef.current) as THREE.Object3D | null;
-        if (!root) return;
-    
-        const assign = () => {
-          root.updateWorldMatrix(true, true);
-    
-          const box = new THREE.Box3().setFromObject(root);
-          const pivotWS = new THREE.Vector3(); box.getCenter(pivotWS);
-          const sizeWS = new THREE.Vector3();  box.getSize(sizeWS);
-          const sizeRef = Math.max(sizeWS.x, sizeWS.y, sizeWS.z) || 1;
-    
-          if (!IS_WEBGPU && sharedMatRef.current) {
-            (sharedMatRef.current as MaterialWithTri).userData.triUniforms!.triPivot.value.copy(pivotWS);
-          }
-    
-          root.traverse((o) => {
-            const maybeMesh = o as THREE.Mesh;
-            if (maybeMesh.isMesh) {
-              const mesh = maybeMesh as THREE.Mesh;
-              mesh.castShadow = true;
-              mesh.receiveShadow = true;
-              mesh.material = sharedMatRef.current!;
-              if (IS_WEBGPU) {
-                boxProjectUVsCentered(mesh.geometry as THREE.BufferGeometry, mesh, pivotWS, sizeRef);
-              }
-            }
-          });
-        };
-    
-        // run now and once next frame (covers late-mounting GLB children)
-        assign();
-        const raf = requestAnimationFrame(assign);
-        return () => cancelAnimationFrame(raf);
-      }, [isGLB, glbPath, meshIndex, glbMountTick]);
+    const root = (isGLB ? groupRef.current : meshRef.current) as THREE.Object3D | null;
+    if (!root) return;
+
+    const assign = () => {
+      root.updateWorldMatrix(true, true);
+      root.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        if (mesh.isMesh) {
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
+          mesh.material = sharedMatRef.current!;
+        }
+      });
+
+      // Center the triplanar projection + liquid mask on the object's bounding
+      // box so texturing and the flood front are stable regardless of the
+      // model's size/offset. invSpanY normalises the mask's vertical sweep to
+      // the object's height.
+      const box = new THREE.Box3().setFromObject(root);
+      const center = new THREE.Vector3();
+      const size = new THREE.Vector3();
+      box.getCenter(center);
+      box.getSize(size);
+      const n = nodesRef.current;
+      if (n) {
+        n.pivot.value.copy(center);
+        n.invSpanY.value = 1 / Math.max(size.y, 0.001);
+      }
+
+      invalidate();
+    };
+
+    // run now and once next frame (covers late-mounting GLB children)
+    assign();
+    const raf = requestAnimationFrame(assign);
+    return () => cancelAnimationFrame(raf);
+  }, [isGLB, glbPath, meshIndex, glbMountTick, invalidate]);
 
   /* Primitives: indices 5..9 */
   const primitive = !isGLB &&
     (() => {
-    switch (meshIndex) {
-        case 5:
+      switch (meshDef?.name) {
+        case 'Sphere':
           return <sphereGeometry args={[1, 64, 64]} />;
-        case 6:
+        case 'Box':
           return <boxGeometry args={[1.5, 1.5, 1.5]} />;
-        case 7:
+        case 'Torus':
           return <torusGeometry args={[1, 0.4, 32, 64]} />;
-        case 8:
+        case 'Cone':
           return <coneGeometry args={[1, 2, 24]} />;
-        case 9:
+        case 'Cylinder':
           return <cylinderGeometry args={[1, 1, 2, 64]} />;
         default:
           return <sphereGeometry args={[1, 64, 64]} />;
-    }
-  })();
+      }
+    })();
 
   return (
     <>
       {isGLB ? (
         <group ref={groupRef} position={[0, 0, 0]} key={`glb-${glbPath}-${ctxVersion}`}>
           <Suspense fallback={null}>
-            <GlbNode
-              path={glbPath}
-              onReady={() => {
-                setGlbMountTick((t) => t + 1);
-                setLoadingGlb(false);
-              }}
-            />
+            <GlbNode path={glbPath} onReady={handleGlbReady} />
           </Suspense>
         </group>
       ) : (
-          <mesh
-            ref={meshRef}
-            position={[0, 0, 0]}
-            castShadow
-            key={`prim-${meshIndex}-${ctxVersion}`}
-          >
+        <mesh ref={meshRef} position={[0, 0, 0]} castShadow key={`prim-${meshIndex}-${ctxVersion}`}>
           {primitive}
           <primitive attach="material" object={sharedMatRef.current!} />
         </mesh>
@@ -937,65 +1056,12 @@ const Scene = memo(function Scene({
         </Html>
       )}
 
-      {/* 
-        FLOOR PLANE 
-        - Large circular plane positioned below the model
-        - Receives shadows from the model
-        - Simple metallic material for best performance
-        
-        NOTE: Reflective floor (MeshReflectorMaterial) is disabled for performance.
-        It was causing rendering issues and high GPU usage.
-        Keeping it commented for future reference:
-        
-        <MeshReflectorMaterial
-          key={`refl-${ctxVersion}`}
-          mirror={0.08}
-          metalness={1}
-          roughness={0.55}
-          color="#2a2438"
-          resolution={1024}
-          blur={[280, 100]}
-          mixStrength={2.1}
-          minDepthThreshold={0.8}
-          maxDepthThreshold={1.2}
-          depthScale={0.5}
-        />
-      */}
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -1.5, -0.3]} receiveShadow>
-        <circleGeometry args={[10, 64]} />
-        <meshPhysicalMaterial color="#2a2438" metalness={1} roughness={0.55} />
-        
-      </mesh>
+      {/* Floor removed: the reflective WaterMesh ocean (see SkyOcean) is the ground. */}
 
-      {/* 
-        LIGHTING SETUP 
-        Three-point lighting for good visibility and depth perception
-      */}
-      
-      {/* Ambient light - provides base illumination from all directions */}
+      {/* Fill lighting. The key "sun" directional light lives in <SunLight>
+          (in the Canvas) so it can follow the SunControl without re-rendering
+          this memoized Scene. */}
       <ambientLight intensity={0.3} />
-      
-      {/* 
-        Directional light - simulates sunlight
-        - Main light source creating shadows
-        - Positioned above and to the side for dramatic lighting
-        - Shadow camera settings define the shadow map coverage area
-      */}
-      <directionalLight
-        position={[8, 10, 6]}
-        intensity={1.0}
-        castShadow={!safeMode}
-        shadow-mapSize-width={safeMode ? 512 : 256}
-        shadow-mapSize-height={safeMode ? 512 : 256}
-        shadow-camera-far={20}
-        shadow-camera-left={-10}
-        shadow-camera-right={10}
-        shadow-camera-top={10}
-        shadow-camera-bottom={-10}
-        shadow-bias={-0.0001}
-      />
-      
-      {/* Point light - fill light from below to reduce harsh shadows */}
       <pointLight position={[-10, -10, -5]} intensity={0.25} />
     </>
   );
@@ -1005,64 +1071,60 @@ const Scene = memo(function Scene({
  * ============================================================================
  * THREECANVAS - ROOT COMPONENT
  * ============================================================================
- * This is the main exported component that sets up the entire 3D viewer.
- * 
- * Features:
- * - WebGPU support with automatic fallback to WebGL
- * - Interactive 3D model viewer with orbit controls
- * - Material editor with real-time updates
- * - Texture support with loading indicators
- * - Responsive UI with mobile drawer
- * - Context loss recovery (safe mode)
- * - Performance optimizations (memoization, caching)
- * 
- * Architecture:
- * - Canvas: React Three Fiber's root component for 3D rendering
- * - Scene: Contains the 3D model, floor, and lighting
- * - Environment: Provides HDR lighting and background
- * - OrbitControls: Camera control for viewing the model
- * - UI Panel: Material and mesh selection interface
+ * Sets up the WebGPU-powered 3D viewer with automatic WebGL2 fallback.
  */
 export function ThreeCanvas() {
   // ========== STATE MANAGEMENT ==========
-  
-  // Currently selected mesh and material indices
   const [meshIndex, setMeshIndex] = useState(0);
   const [matIndex, setMatIndex] = useState(0);
-  
-  // Material parameters (roughness, metalness, transmission, etc.)
+
   const [params, setParams] = useState<THREE.MeshPhysicalMaterialParameters & { color?: string }>(
     MATERIALS[0].base as THREE.MeshPhysicalMaterialParameters & { color?: string },
   );
-  
-  // Canvas ref for touch scroll prevention
-  const canvasRef = useRef<HTMLDivElement>(null);
-  
-  // Current texture URL (if the selected material has one)
-  const currentMapUrl = (MATERIALS[matIndex] as { mapUrl?: string }).mapUrl;
 
-  // Texture scaling/tiling factor
+  const canvasRef = useRef<HTMLDivElement>(null);
+
+  const currentMapUrl = (MATERIALS[matIndex] as { mapUrl?: string }).mapUrl;
+  const currentNormalUrl = (MATERIALS[matIndex] as { normalUrl?: string }).normalUrl;
   const [texScale, setTexScale] = useState(0.56);
 
   // ========== RENDERING SETTINGS (CONSTANT) ==========
-  // These values never change, so we use useMemo to prevent re-renders
-  const exposure = React.useMemo(() => 0.62, []);        // Overall scene brightness
-  const envIntensity = React.useMemo(() => 0.6, []);     // Environment map reflection strength
-  const bgIntensity = React.useMemo(() => 1.0, []);      // Background brightness
-  const bgBlur = React.useMemo(() => 0.8, []);           // Background blur amount
-  
-  // Safe mode: enabled after WebGL context loss, reduces quality to prevent further issues
+  const exposure = React.useMemo(() => SCENE_EXPOSURE, []); // matches the ocean reference scene
+  const envIntensity = React.useMemo(() => ENV_INTENSITY, []);
+  const bgIntensity = React.useMemo(() => 1.0, []);
+  const bgBlur = React.useMemo(() => 0.8, []);
+
+  // Safe mode: enabled after a context loss; reduces quality to recover.
   const [safeMode, setSafeMode] = useState(false);
-  
-  // Context version: incremented after context loss to force re-creation of resources
   const [ctxVersion, setCtxVersion] = useState(0);
 
-  // ========== UI STATE ==========
-  const [panelOpen, setPanelOpen] = useState(false);     // Mobile drawer open/closed
-  const [sceneReady, setSceneReady] = useState(false);   // Track when initial scene is loaded
+  // True once we confirm the active backend is WebGPU. TSL post-processing
+  // (SSGI/bloom/lens flare) only mounts in that case; the WebGL2 fallback keeps
+  // R3F's normal auto-render.
+  const [isWebGPU, setIsWebGPU] = useState(false);
 
-  // ========== DERIVED STATE ==========
-  // Check if current material is glass (for showing/hiding relevant controls)
+  // ========== PERFORMANCE: pause rendering when the hero is off-screen ==========
+  // Auto-rotation needs a continuous loop while visible, but there's no reason to
+  // keep the GPU busy once the user has scrolled to another section.
+  const [frameloop, setFrameloop] = useState<'always' | 'never' | 'demand'>('always');
+
+  // ========== UI STATE ==========
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [sceneReady, setSceneReady] = useState(false);
+  const handleSceneReady = useCallback(() => setSceneReady(true), []);
+
+  // ========== SUN STATE (driven by the SunControl overlay) ==========
+  // dayAngle 0..180 along the arc; initialised from the shared DEFAULT_* values
+  // so the control knob and the scene's sun start in agreement. azimuth = rotation.
+  const [dayAngle, setDayAngle] = useState<number>(DEFAULT_DAY_ANGLE);
+  const [sunAzimuth, setSunAzimuth] = useState<number>(DEFAULT_SUN_AZIMUTH);
+  // Shared sun direction: drives the sky scattering, ocean specular, and the
+  // directional key light, so sunset/dawn sit on opposite sides of the sky.
+  const sunDir = React.useMemo(
+    () => sunDirectionFromState(dayAngle, sunAzimuth),
+    [dayAngle, sunAzimuth],
+  );
+
   const isGlass = (params.transmission ?? 0) > 0.01;
 
   useEffect(() => {
@@ -1071,42 +1133,43 @@ export function ThreeCanvas() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  // ========== DISABLE TOUCH SCROLL IN FIRST SECTION (MOBILE ONLY) ==========
-  // On mobile, completely prevent scroll in the first section (3D viewer only)
-  // Other sections scroll normally
+  // Pause/resume the render loop based on canvas visibility.
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el || typeof IntersectionObserver === 'undefined') return;
+    const io = new IntersectionObserver(
+      ([entry]) => setFrameloop(entry.isIntersecting ? 'always' : 'never'),
+      { threshold: 0.05 },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, []);
+
+  // Disable touch scroll in the first section (mobile only) so orbit works.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    // Check if we're in the first section (hero with 3D canvas)
     const isInFirstSection = () => {
       const heroSection = document.getElementById('hero');
       if (!heroSection) return false;
-      
       const rect = heroSection.getBoundingClientRect();
       const viewportHeight = window.innerHeight;
-      
-      // First section is visible if it occupies significant viewport
       return rect.top > -viewportHeight * 0.3 && rect.bottom > viewportHeight * 0.7;
     };
 
     const handleTouchMove = (e: TouchEvent) => {
-      // Don't prevent if touch is on UI controls (sliders, buttons, selects)
       const target = e.target as HTMLElement;
       if (target.closest('.ui-range, .ui-select, .ui-button, input, select, button, [data-no-snap]')) {
-        return; // Allow normal interaction with UI elements
+        return;
       }
-
-      // Completely prevent scroll in first section on mobile (for canvas area only)
       if (isInFirstSection()) {
         e.preventDefault();
         e.stopPropagation();
       }
     };
 
-    // Use passive: false to allow preventDefault
     canvas.addEventListener('touchmove', handleTouchMove, { passive: false });
-
     return () => {
       canvas.removeEventListener('touchmove', handleTouchMove);
     };
@@ -1123,10 +1186,6 @@ export function ThreeCanvas() {
     });
   }, [matIndex, currentMapUrl]);
 
-  useEffect(() => {
-    gsap.to({}, { duration: 0.25 });
-  }, [meshIndex, matIndex]);
-
   const panelVars: CSSProperties & Record<'--panel-top' | '--panel-bottom', string> = {
     '--panel-top': 'calc(env(safe-area-inset-top) + 72px)',
     '--panel-bottom': 'calc(env(safe-area-inset-bottom) + 24px)',
@@ -1134,102 +1193,110 @@ export function ThreeCanvas() {
 
   return (
     <div ref={canvasRef} className="w-full h-screen relative">
-        <Canvas
-          shadows={!safeMode}
-          style={{ touchAction: 'pan-y' }}
-          className="w-full h-full"
-          dpr={safeMode ? 1 : Math.min(window.devicePixelRatio, 1.5)}
-          frameloop="demand"
-          // r3f accepts a Promise here at runtime
-          // @ts-expect-error - async renderer factory is supported by r3f
-          gl={(canvas: HTMLCanvasElement) => {
-            if (IS_WEBGPU) {
-              return (async () => {
-                const WebGPURenderer = await loadWebGPURenderer();
-                if (WebGPURenderer) {
-                  console.log('✅ WebGPU Renderer loaded successfully');
-                  const r = new WebGPURenderer({ canvas, antialias: !safeMode });
-                  if (typeof r.init === 'function') await r.init();
-                  // r3f accepts a WebGPURenderer as well; cast keeps TS calm
-                  return r as unknown as THREE.WebGLRenderer;
-                }
-                console.log('⚠️ WebGPU not available, falling back to WebGL');
-                return new THREE.WebGLRenderer({
-                  canvas,
-                  antialias: !safeMode,
-                  alpha: false,
-                  powerPreference: 'high-performance',
-                  stencil: false,
-                  depth: true,
-                });
-              })();
-            }
-            console.log('Using WebGL Renderer');
-            return new THREE.WebGLRenderer({
-              canvas,
-              antialias: !safeMode,
-              alpha: false,
-              powerPreference: 'high-performance',
-              stencil: false,
-              depth: true,
-            });
+      <Canvas
+        shadows={!safeMode}
+        style={{ touchAction: 'pan-y' }}
+        className="w-full h-full"
+        dpr={safeMode ? 1 : [1, 1.5]}
+        frameloop={frameloop}
+        // Async WebGPU renderer factory. R3F v9 natively supports returning a
+        // promise here. WebGPURenderer uses WebGPU when available and transparently
+        // falls back to a WebGL2 backend otherwise.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        gl={(async (props: any) => {
+          const renderer = new THREE.WebGPURenderer({
+            ...props,
+            antialias: !safeMode,
+            powerPreference: 'high-performance',
+            forceWebGL: false,
+            alpha: false,
+          });
+          await renderer.init();
+          return renderer;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        }) as any}
+        camera={{ position: [0, 0, 4], fov: 50, near: 0.1, far: 20000 }}
+        performance={{ min: 0.5, max: 1, debounce: 50 }}
+        onCreated={(state) => {
+          const gl = state.gl as AnyRenderer;
+          const scene = state.scene as THREE.Scene;
+          gl.toneMapping = THREE.ACESFilmicToneMapping;
+          gl.outputColorSpace = THREE.SRGBColorSpace;
+          const webgpu = !!gl?.backend?.isWebGPUBackend;
+          setIsWebGPU(webgpu);
+          // eslint-disable-next-line no-console
+          console.log(`[3D] Renderer backend: ${webgpu ? 'WebGPU' : 'WebGL2 (fallback)'}`);
+          const s = scene as SceneWithBg;
+          s.backgroundIntensity = 1;
+          s.backgroundBlurriness = 1;
+        }}
+      >
+        <Exposure value={exposure} />
+        <SceneEnvIntensity value={envIntensity} />
+        <BackgroundTune intensity={bgIntensity} blur={bgBlur} />
+        <ContextLossProtector
+          onLost={() => setSafeMode(true)}
+          onRestored={() => {
+            setCtxVersion((v) => v + 1);
+            setSafeMode(false);
           }}
-          camera={{ position: [0, 0, 4], fov: 50, near: 0.1, far: 100 }}
-          performance={{ min: 0.5, max: 1, debounce: 50 }}
-          onCreated={(state) => {
-            const gl = state.gl as unknown as THREE.WebGLRenderer;
-            const scene = state.scene as THREE.Scene;
-            gl.toneMapping = THREE.ACESFilmicToneMapping;
-            gl.outputColorSpace = THREE.SRGBColorSpace;
-            if (!IS_WEBGPU) gl.setClearColor(0x000000, 0);
-            const s = scene as SceneWithBg;
-            s.backgroundIntensity = 1;
-            s.backgroundBlurriness = 1;
-          }}
-        >
-          <FrameInvalidator />
-          <Exposure value={exposure} />
-          <SceneEnvIntensity value={envIntensity} />
-          <BackgroundTune intensity={bgIntensity} blur={bgBlur} />
-          <ContextLossProtector
-            onLost={() => setSafeMode(true)}
-            onRestored={() => {
-              setCtxVersion((v) => v + 1);
-              setSafeMode(false);
-            }}
+        />
+
+        {/* Sunset HDR provides the model's ambient lighting + reflections.
+            No `background` prop, so the analytic sky stays the visible backdrop.
+            environmentIntensity is kept in sync with ENV_INTENSITY so drei
+            doesn't reset the scene-level intensity after SceneEnvIntensity runs. */}
+        <Environment
+          key={`env-${ctxVersion}`}
+          files="/sunset.hdr"
+          environmentIntensity={envIntensity}
+        />
+
+        {/* WebGPU analytic sky + reflective ocean (replaces the old floor) */}
+        <SkyOcean
+          key={`skyocean-${ctxVersion}`}
+          sunDirection={sunDir}
+          oceanY={OCEAN_Y}
+          exposure={exposure}
+        />
+
+        {/* Key "sun" light, follows the same direction as the sky/ocean sun */}
+        <SunLight sunDirection={sunDir} safeMode={safeMode} />
+
+        <Suspense fallback={null}>
+          <Scene
+            meshIndex={meshIndex}
+            matIndex={matIndex}
+            params={params}
+            envIntensity={envIntensity}
+            safeMode={safeMode}
+            mapUrl={currentMapUrl}
+            triScale={texScale}
+            ctxVersion={ctxVersion}
+            onReady={handleSceneReady}
           />
+          <Preload all />
+        </Suspense>
 
-          {/* Environment using local HDR file */}
-          <Environment 
-            key={`env-${ctxVersion}`}
-            files="/sunset.hdr"
-            background
-            blur={bgBlur}
-          />
+        <SmartOrbitControls />
 
-          <Suspense fallback={null}>
-            <Scene
-              meshIndex={meshIndex}
-              params={params}
-              envIntensity={envIntensity}
-              safeMode={safeMode}
-              mapUrl={currentMapUrl}
-              triScale={texScale}
-              ctxVersion={ctxVersion}
-              onReady={() => setSceneReady(true)}
-            />
-            <Preload all />
-          </Suspense>
+        {/* SSGI + bloom + lens flare. Mounted only on the WebGPU backend and
+            outside safeMode; it takes over the render loop via a priority frame
+            callback, so on the WebGL2 fallback R3F keeps auto-rendering. */}
+        {isWebGPU && !safeMode && <PostFX key={`postfx-${ctxVersion}`} />}
+      </Canvas>
 
-          <SmartOrbitControls />
-        </Canvas>
-
-      {/* 
-        UI CONTROLS - Only shown after scene is ready
-        Prevents flickering during initial load
-      */}
+      {/* UI CONTROLS - Only shown after scene is ready */}
       {sceneReady && (
         <>
+          {/* Sun control (bottom-right, below the control panel): drives sky scattering + ocean specular */}
+          <SunControl
+            dayAngle={dayAngle}
+            azimuth={sunAzimuth}
+            onDayAngle={setDayAngle}
+            onAzimuth={setSunAzimuth}
+          />
+
           {/* Hamburger button for mobile */}
           <button
             type="button"
@@ -1249,7 +1316,6 @@ export function ThreeCanvas() {
             </svg>
           </button>
 
-          {/* Backdrop overlay for mobile drawer */}
           {panelOpen && (
             <button aria-label="Close controls" onClick={() => setPanelOpen(false)} className="fixed inset-0 z-[55] bg-black/40 backdrop-blur-sm lg:hidden" />
           )}
@@ -1266,105 +1332,128 @@ export function ThreeCanvas() {
               max-h-[calc(100svh-var(--panel-top)-var(--panel-bottom))] overflow-y-auto overscroll-contain
               transform transition-transform duration-300 ease-out
               ${panelOpen ? 'translate-x-0' : 'translate-x-[calc(100%+1rem)]'}
-              lg:absolute lg:right-12 lg:top-24 lg:max-h-[calc(100svh-8rem)] lg:translate-x-0
+              lg:absolute lg:right-12 lg:top-24 lg:max-h-[calc(100svh-21rem)] lg:translate-x-0
               lg:animate-in lg:fade-in lg:slide-in-from-right-4 lg:duration-500
             `}
           >
-        {/* Mesh */}
-        <div className="flex items-center justify-between gap-2">
-          <label htmlFor="mesh" className="text-xs opacity-80">
-            Mesh
-          </label>
-          <select id="mesh" className="ui-select" value={meshIndex} onChange={(e) => setMeshIndex(Number(e.target.value))}>
-            {MESHES.map((m, i) => (
-              <option key={m.name} value={i}>
-                {m.name}
-              </option>
-            ))}
-          </select>
-        </div>
+            {/* Mesh */}
+            <div className="flex items-center justify-between gap-2">
+              <label htmlFor="mesh" className="text-xs opacity-80">
+                Mesh
+              </label>
+              <select id="mesh" className="ui-select" value={meshIndex} onChange={(e) => setMeshIndex(Number(e.target.value))}>
+                {MESHES.map((m, i) => (
+                  <option key={m.name} value={i}>
+                    {m.name}
+                  </option>
+                ))}
+              </select>
+            </div>
 
-        {/* Material */}
-        <div className="flex items-center justify-between gap-2 mt-2">
-          <label htmlFor="mat" className="text-xs opacity-80">
-            Material
-          </label>
-          <select id="mat" className="ui-select" value={matIndex} onChange={(e) => setMatIndex(Number(e.target.value))}>
-            {MATERIALS.map((m, i) => (
-              <option key={m.name} value={i}>
-                {m.name}
-              </option>
-            ))}
-          </select>
-        </div>
+            {/* Material — 4×5 grid of circular swatch thumbnails. Texture
+                materials show their image; color materials show their hex; Glass
+                and Chrome use a representative gradient. */}
+            <div className="mt-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs opacity-80">Material</span>
+                <span className="text-xs font-medium text-white/90">{MATERIALS[matIndex].name}</span>
+              </div>
+              <div className="mt-2 grid grid-cols-5 gap-2">
+                {MATERIALS.map((m, i) => {
+                  const mat = m as { name: string; mapUrl?: string; thumb?: string; base: { color?: string } };
+                  const swatchStyle: CSSProperties = mat.mapUrl
+                    ? { backgroundImage: `url(${mat.mapUrl})`, backgroundSize: 'cover', backgroundPosition: 'center' }
+                    : mat.thumb
+                      ? { backgroundImage: mat.thumb }
+                      : { backgroundColor: mat.base.color || '#ffffff' };
+                  const selected = matIndex === i;
+                  return (
+                    <button
+                      key={mat.name}
+                      type="button"
+                      title={mat.name}
+                      aria-label={mat.name}
+                      aria-pressed={selected}
+                      onClick={() => setMatIndex(i)}
+                      style={swatchStyle}
+                      className={`relative mx-auto aspect-square w-[78%] rounded-full bg-cover bg-center shadow-md outline-none transition-transform duration-150 hover:scale-110 focus-visible:ring-2 focus-visible:ring-white/80 ${
+                        selected
+                          ? 'scale-105 ring-2 ring-white ring-offset-2 ring-offset-purple-950/60'
+                          : 'ring-1 ring-white/20'
+                      }`}
+                    />
+                  );
+                })}
+              </div>
+            </div>
 
-        {/* Controls */}
-        <div className="mt-3 mb-2 space-y-2">
-          {!currentMapUrl && (
-            <Color label="Albedo" value={(params.color as string) || '#ffffff'} onChange={(hex) => setParams((p) => ({ ...p, color: hex }))} />
-          )}
-          {currentMapUrl && <Slider label="Texture Scale" min={0.3} max={3} step={0.01} value={texScale} onChange={setTexScale} />}
-            <Slider
-            label="Roughness"
-            min={0}
-            max={1}
-            step={0.01}
-            value={params.roughness ?? 0.5}
-            onChange={(v) => setParams((p) => ({ ...p, roughness: v }))}
-          />
-          <Slider
-            label="Metalness"
-            min={0}
-            max={1}
-            step={0.01}
-            value={params.metalness ?? 0}
-            onChange={(v) => setParams((p) => ({ ...p, metalness: v }))}
-          />
-
-          {isGlass && (
-            <>
-              <Slider label="IOR" min={1} max={2.333} step={0.001} value={params.ior ?? 1.5} onChange={(v) => setParams((p) => ({ ...p, ior: v }))} />
+            {/* Controls */}
+            <div className="mt-3 mb-2 space-y-2">
+              {!currentMapUrl && (
+                <Color label="Albedo" value={(params.color as string) || '#ffffff'} onChange={(hex) => setParams((p) => ({ ...p, color: hex }))} />
+              )}
+              {(currentMapUrl || currentNormalUrl) && <Slider label="Texture Scale" min={0.3} max={3} step={0.01} value={texScale} onChange={setTexScale} />}
               <Slider
-                label="Transmission"
+                label="Roughness"
                 min={0}
                 max={1}
                 step={0.01}
-                value={params.transmission ?? 0}
-                onChange={(v) => setParams((p) => ({ ...p, transmission: v }))}
+                value={params.roughness ?? 0.5}
+                onChange={(v) => setParams((p) => ({ ...p, roughness: v }))}
               />
               <Slider
-                label="Thickness"
+                label="Metalness"
                 min={0}
-              max={2}
-              step={0.01}
-                value={params.thickness ?? 0}
-                onChange={(v) => setParams((p) => ({ ...p, thickness: v }))}
+                max={1}
+                step={0.01}
+                value={params.metalness ?? 0}
+                onChange={(v) => setParams((p) => ({ ...p, metalness: v }))}
               />
-            </>
-          )}
 
-          {!isGlass && (
-            <>
-              <Slider
-                label="Clearcoat"
-                min={0}
-                max={1}
-                step={0.01}
-                value={params.clearcoat ?? 0}
-                onChange={(v) => setParams((p) => ({ ...p, clearcoat: v }))}
-              />
-              <Slider
-                label="Clearcoat Roughness"
-                min={0}
-                max={1}
-                step={0.01}
-                value={params.clearcoatRoughness ?? 0}
-                onChange={(v) => setParams((p) => ({ ...p, clearcoatRoughness: v }))}
-              />
-            </>
-          )}
-        </div>
-      </div>
+              {isGlass && (
+                <>
+                  <Slider label="IOR" min={1} max={2.333} step={0.001} value={params.ior ?? 1.5} onChange={(v) => setParams((p) => ({ ...p, ior: v }))} />
+                  <Slider
+                    label="Transmission"
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    value={params.transmission ?? 0}
+                    onChange={(v) => setParams((p) => ({ ...p, transmission: v }))}
+                  />
+                  <Slider
+                    label="Thickness"
+                    min={0}
+                    max={2}
+                    step={0.01}
+                    value={params.thickness ?? 0}
+                    onChange={(v) => setParams((p) => ({ ...p, thickness: v }))}
+                  />
+                </>
+              )}
+
+              {!isGlass && (
+                <>
+                  <Slider
+                    label="Clearcoat"
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    value={params.clearcoat ?? 0}
+                    onChange={(v) => setParams((p) => ({ ...p, clearcoat: v }))}
+                  />
+                  <Slider
+                    label="Clearcoat Roughness"
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    value={params.clearcoatRoughness ?? 0}
+                    onChange={(v) => setParams((p) => ({ ...p, clearcoatRoughness: v }))}
+                  />
+                </>
+              )}
+            </div>
+          </div>
         </>
       )}
     </div>
@@ -1406,6 +1495,7 @@ function Slider({
     </div>
   );
 }
+
 function Color({ label, value, onChange }: { label: string; value: string; onChange: (hex: string) => void }) {
   return (
     <div className="flex items-center justify-between gap-2">
@@ -1415,22 +1505,20 @@ function Color({ label, value, onChange }: { label: string; value: string; onCha
   );
 }
 
-/* ---- Preload Mother Earth + first texture aggressively ---- */
+/* ---- Preload GLB models so they're ready on first interaction ---- */
 try { useGLTF.preload('/glb1.glb'); } catch {}
-// keep your other preloads if you want them:
 [2, 3, 4, 5].forEach((n) => { try { useGLTF.preload(`/glb${n}.glb`); } catch {} });
 
-// Warm up the first texture used by default (Texture 1) so it’s ready on first frame
+// Warm up the first texture (Texture 1) so it's ready on first frame.
 const _prewarmTex = (() => {
   let started = false;
   return () => {
-    if (started) return;
+    if (started || typeof window === 'undefined') return;
     started = true;
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.decoding = 'async';
     img.src = '/texture1.jpg';
-    // No onload needed; the browser will cache it for TextureLoader.
   };
 })();
 _prewarmTex();
