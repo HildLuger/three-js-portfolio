@@ -14,7 +14,7 @@ import { OrbitControls, Environment, useGLTF, Html, Preload } from '@react-three
 // Bottom-left sun control overlay (controlled component)
 import SunControl, { sunDirectionFromState } from './SunControl';
 
-// WebGPU/TSL post-processing: SSGI + bloom + lens flare. Owns the render loop,
+// WebGPU/TSL post-processing: bloom + lens flare. Owns the render loop,
 // so it is only mounted on the WebGPU backend (not the WebGL2 fallback).
 import PostFX from './PostFX';
 
@@ -1099,7 +1099,7 @@ export function ThreeCanvas() {
   const [ctxVersion, setCtxVersion] = useState(0);
 
   // True once we confirm the active backend is WebGPU. TSL post-processing
-  // (SSGI/bloom/lens flare) only mounts in that case; the WebGL2 fallback keeps
+  // (bloom/lens flare) only mounts in that case; the WebGL2 fallback keeps
   // R3F's normal auto-render.
   const [isWebGPU, setIsWebGPU] = useState(false);
 
@@ -1280,7 +1280,7 @@ export function ThreeCanvas() {
 
         <SmartOrbitControls />
 
-        {/* SSGI + bloom + lens flare. Mounted only on the WebGPU backend and
+        {/* Bloom + lens flare. Mounted only on the WebGPU backend and
             outside safeMode; it takes over the render loop via a priority frame
             callback, so on the WebGL2 fallback R3F keeps auto-rendering. */}
         {isWebGPU && !safeMode && <PostFX key={`postfx-${ctxVersion}`} />}
