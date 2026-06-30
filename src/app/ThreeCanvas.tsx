@@ -590,6 +590,47 @@ function SunLight({
 
 /**
  * ============================================================================
+ * SHADER COMPILER (loading gate)
+ * ============================================================================
+ * Precompiles the current scene's WebGPU render pipelines BEFORE the loading
+ * overlay is lifted, so the very first visible frame is already smooth and the
+ * user never sees a shader-compile hitch. `active` is flipped on only once the
+ * assets are downloaded and the initial mesh/material are actually mounted, so
+ * compileAsync sees the real material graph. Runs once per context.
+ */
+function ShaderCompiler({ active, onCompiled }: { active: boolean; onCompiled: () => void }) {
+  const { gl, scene, camera } = useThree();
+  const doneRef = useRef(false);
+
+  useEffect(() => {
+    if (!active || doneRef.current) return;
+    doneRef.current = true;
+    let cancelled = false;
+
+    (async () => {
+      const renderer = gl as AnyRenderer;
+      try {
+        if (typeof renderer.compileAsync === 'function') {
+          await renderer.compileAsync(scene, camera);
+        }
+      } catch {
+        // Compilation is best-effort; reveal regardless so we never hard-block.
+      }
+      // One more frame to ensure pipelines for the sky/ocean/postFX are warm.
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
+      if (!cancelled) onCompiled();
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [active, gl, scene, camera, onCompiled]);
+
+  return null;
+}
+
+/**
+ * ============================================================================
  * SCENE COMPONENT
  * ============================================================================
  */
@@ -1130,6 +1171,83 @@ export function ThreeCanvas() {
   const [sceneReady, setSceneReady] = useState(false);
   const handleSceneReady = useCallback(() => setSceneReady(true), []);
 
+  // ========== LOADING GATE ==========
+  // The 3D scene stays hidden behind a full-screen loading overlay until:
+  //   1. EVERY asset is downloaded/decoded — all material textures (albedo +
+  //      normal), all GLB meshes, the HDR environment and the water normals —
+  //      so switching mesh/material later is instant (no mid-session fetch).
+  //   2. The current scene's WebGPU shaders are compiled (see <ShaderCompiler>).
+  // `assetsReady` covers (1); `shadersReady` covers (2); `sceneReady` confirms
+  // the initial mesh + material are mounted. `appReady` is the AND of all three.
+  const [assetsReady, setAssetsReady] = useState(false);
+  const [shadersReady, setShadersReady] = useState(false);
+  const [loadProgress, setLoadProgress] = useState(0);
+  const appReady = assetsReady && sceneReady && shadersReady;
+  const handleShadersReady = useCallback(() => setShadersReady(true), []);
+
+  // Keep the overlay mounted briefly after readiness so it can fade out.
+  const [overlayGone, setOverlayGone] = useState(false);
+  useEffect(() => {
+    if (!appReady) return;
+    const t = window.setTimeout(() => setOverlayGone(true), 650);
+    return () => window.clearTimeout(t);
+  }, [appReady]);
+
+  // Preload EVERYTHING up front, behind the loading screen. Textures go through
+  // the shared `_texCache` (so the morph and the swatches reuse them); GLBs +
+  // HDR + water normals are fetched so the browser HTTP-caches them (drei's
+  // useGLTF.preload + Environment then parse straight from that cache). Progress
+  // drives the overlay's percentage.
+  useEffect(() => {
+    let cancelled = false;
+
+    const texUrls: Array<[string, boolean]> = [];
+    for (const mm of MATERIALS) {
+      const m = mm as { mapUrl?: string; normalUrl?: string };
+      if (m.mapUrl) texUrls.push([m.mapUrl, false]);
+      if (m.normalUrl) texUrls.push([m.normalUrl, true]);
+    }
+    const glbUrls = (MESHES as Array<{ glb?: string }>)
+      .map((m) => m.glb)
+      .filter((g): g is string => typeof g === 'string');
+    const extraUrls = ['/sunset.hdr', '/waternormals.jpg'];
+
+    const total = texUrls.length + glbUrls.length + extraUrls.length;
+    let done = 0;
+    const bump = () => {
+      if (cancelled) return;
+      done += 1;
+      setLoadProgress(done / total);
+    };
+
+    const texJobs = texUrls.map(([url, isNormal]) =>
+      getCachedTexture(url, isNormal).then(bump).catch(bump),
+    );
+
+    // Fetch the binary assets so they sit in the HTTP cache; drei's GLTF cache
+    // + the Environment loader then resolve instantly from it. Reading the body
+    // ensures the download actually completed before we count it as ready.
+    const fetchJob = (url: string) =>
+      fetch(url)
+        .then((r) => r.arrayBuffer())
+        .then(() => bump())
+        .catch(() => bump());
+    const glbJobs = glbUrls.map((url) => {
+      const job = fetchJob(url);
+      try { useGLTF.preload(url); } catch {}
+      return job;
+    });
+    const extraJobs = extraUrls.map(fetchJob);
+
+    Promise.all([...texJobs, ...glbJobs, ...extraJobs]).then(() => {
+      if (!cancelled) setAssetsReady(true);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // ========== SUN STATE (driven by the SunControl overlay) ==========
   // dayAngle 0..180 along the arc; initialised from the shared DEFAULT_* values
   // so the control knob and the scene's sun start in agreement. azimuth = rotation.
@@ -1297,14 +1415,41 @@ export function ThreeCanvas() {
 
         <SmartOrbitControls />
 
+        {/* Precompile shaders before lifting the loading overlay. Gated on the
+            assets being downloaded AND the initial mesh/material being mounted
+            so compileAsync sees the real material graph. */}
+        <ShaderCompiler active={assetsReady && sceneReady} onCompiled={handleShadersReady} />
+
         {/* Bloom + lens flare. Mounted only on the WebGPU backend and
             outside safeMode; it takes over the render loop via a priority frame
             callback, so on the WebGL2 fallback R3F keeps auto-rendering. */}
         {isWebGPU && !safeMode && <PostFX key={`postfx-${ctxVersion}`} />}
       </Canvas>
 
-      {/* UI CONTROLS - Only shown after scene is ready */}
-      {sceneReady && (
+      {/* Full-screen loading overlay — opaque, so the 3D scene is never visible
+          until every asset is downloaded and the shaders are compiled. */}
+      {!overlayGone && (
+        <div
+          aria-hidden={appReady}
+          className={`absolute inset-0 z-[80] flex flex-col items-center justify-center bg-black
+                      transition-opacity duration-500 ease-out
+                      ${appReady ? 'pointer-events-none opacity-0' : 'opacity-100'}`}
+        >
+          <div className="h-10 w-10 animate-spin rounded-full border-2 border-white/20 border-t-white/90" />
+          <div className="mt-5 w-48 overflow-hidden rounded-full bg-white/10">
+            <div
+              className="h-1 rounded-full bg-white/80 transition-[width] duration-200 ease-out"
+              style={{ width: `${Math.round((appReady ? 1 : loadProgress) * 100)}%` }}
+            />
+          </div>
+          <p className="mt-3 text-xs font-medium tracking-wide text-white/70">
+            {appReady ? 'Ready' : `Loading 3D scene… ${Math.round(loadProgress * 100)}%`}
+          </p>
+        </div>
+      )}
+
+      {/* UI CONTROLS - Only shown once everything is loaded + compiled */}
+      {appReady && (
         <>
           {/* Sun control (bottom-right, below the control panel): drives sky scattering + ocean specular */}
           <SunControl
