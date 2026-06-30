@@ -712,10 +712,15 @@ const Scene = memo(function Scene({
   } | null>(null);
   const morphRef = useRef<{
     active: boolean;
+    // True from the instant a switch is requested until its morph actually
+    // starts. On a cold cache the morph waits for the destination texture to
+    // load, and during that gap the slider/scalar effect must NOT mirror or
+    // re-apply anything (it would corrupt the captured "from" snapshot).
+    pending: boolean;
     t: number;
     scalarsApplied: boolean;
     targetScalars: MaterialScalars;
-  }>({ active: false, t: 0, scalarsApplied: true, targetScalars: computeScalars(params) });
+  }>({ active: false, pending: false, t: 0, scalarsApplied: true, targetScalars: computeScalars(params) });
   const firstMatRunRef = useRef(true);
   // Monotonic token so an async texture load from a superseded switch can't
   // clobber the current target (rapid clicking through swatches).
@@ -809,6 +814,14 @@ const Scene = memo(function Scene({
   // material definition + the texture cache here — never from the lagging
   // `params`/`tex` React state — so the texture the morph reveals is always the
   // one for the swatch that was clicked, with no mid/post-transition flips.
+  //
+  // CRITICAL for consistency: the destination texture(s) are made resident
+  // BEFORE the flood starts. When they are already cached (the common case
+  // after preload) we begin synchronously, so warm switches are instant. When
+  // the cache is still cold (e.g. on a slow connection right after load) we
+  // wait for the texture to arrive and only THEN start the morph. This is what
+  // prevents the old "flood reveals the wrong/placeholder texture, then snaps
+  // to the real one with no transition" behaviour seen in production.
   useEffect(() => {
     const n = nodesRef.current;
     const m = sharedMatRef.current;
@@ -821,10 +834,17 @@ const Scene = memo(function Scene({
       bump?: number;
     };
     const base = mat.base;
+    const bumpStrength = mat.bump ?? 0;
+    const token = ++switchTokenRef.current;
     const first = firstMatRunRef.current;
 
-    // 1. Snapshot the currently displayed look into "from" (skipped on the very
-    //    first run, where there is nothing to transition from).
+    // Snapshot the currently displayed look into "from" SYNCHRONOUSLY (skipped
+    // on the very first run, where there is nothing to transition from). Doing
+    // this now — before any await — captures the genuine outgoing appearance and
+    // protects it from the slider/scalar effect, which runs when `params`
+    // updates on this same switch. `pending` keeps that effect hands-off until
+    // the morph actually starts.
+    morphRef.current.pending = true;
     if (!first) {
       n.fromColor.value.copy(n.toColor.value);
       n.fromRough.value = n.toRough.value;
@@ -833,80 +853,74 @@ const Scene = memo(function Scene({
       n.fromTex.value = n.toTex.value;
     }
 
-    // 2. Resolve the NEW material's "to" appearance straight from its definition.
-    if (base.color) n.toColor.value.set(base.color as string);
-    n.toRough.value = base.roughness ?? 0.5;
-    n.toMetal.value = base.metalness ?? 0;
+    // Starts (or, on the very first run, instantly applies) the transition once
+    // every destination texture this material needs is resident. `albedoTex` /
+    // `normalTex` are null when the material has no such map.
+    const begin = (albedoTex: THREE.Texture | null, normalTex: THREE.Texture | null) => {
+      // A newer switch superseded this one while we were loading — drop it.
+      if (switchTokenRef.current !== token) return;
 
-    const token = ++switchTokenRef.current;
+      // Resolve the NEW material's "to" appearance from its definition.
+      if (base.color) n.toColor.value.set(base.color as string);
+      n.toRough.value = base.roughness ?? 0.5;
+      n.toMetal.value = base.metalness ?? 0;
 
-    // Albedo: bind from cache synchronously when warm; otherwise show the solid
-    // color until it loads, then bind it (guarded by `token` against a newer
-    // switch superseding this one).
-    if (mat.mapUrl) {
-      const cached = _texCache.get(mat.mapUrl);
-      if (cached) {
-        n.toTex.value = cached;
+      if (albedoTex) {
+        n.toTex.value = albedoTex;
         n.toIsTex.value = 1;
       } else {
         n.toIsTex.value = 0;
-        getCachedTexture(mat.mapUrl, false)
-          .then((t) => {
-            if (switchTokenRef.current !== token) return;
-            n.toTex.value = t;
-            n.toIsTex.value = 1;
-            if (!morphRef.current.active) {
-              n.fromTex.value = t;
-              n.fromIsTex.value = 1;
-            }
-            invalidate();
-          })
-          .catch(() => {});
       }
-    } else {
-      n.toIsTex.value = 0;
-    }
 
-    // Normal/bump (surface detail, not blended through the mask).
-    if (mat.normalUrl) {
-      const strength = mat.bump ?? 0;
-      const cachedN = _texCache.get(mat.normalUrl);
-      if (cachedN) {
-        n.normalTex.value = cachedN;
-        n.bump.value = strength;
+      // Normal/bump (surface detail, not blended through the mask).
+      if (normalTex) {
+        n.normalTex.value = normalTex;
+        n.bump.value = bumpStrength;
       } else {
         n.bump.value = 0;
-        getCachedTexture(mat.normalUrl, true)
-          .then((t) => {
-            if (switchTokenRef.current !== token) return;
-            n.normalTex.value = t;
-            n.bump.value = strength;
-            invalidate();
-          })
-          .catch(() => {});
       }
-    } else {
-      n.bump.value = 0;
+
+      morphRef.current.targetScalars = computeScalars(base);
+
+      if (first) {
+        // First mount: no animation — mirror "to" into "from", apply scalars now.
+        firstMatRunRef.current = false;
+        n.fromColor.value.copy(n.toColor.value);
+        n.fromRough.value = n.toRough.value;
+        n.fromMetal.value = n.toMetal.value;
+        n.fromIsTex.value = n.toIsTex.value;
+        n.fromTex.value = n.toTex.value;
+        applyScalars(m, morphRef.current.targetScalars);
+      } else {
+        morphRef.current.active = true;
+        morphRef.current.t = 0;
+        morphRef.current.scalarsApplied = false;
+        n.progress.value = 0;
+      }
+      morphRef.current.pending = false;
+      invalidate();
+    };
+
+    // Fast path: every required texture is already cached → begin synchronously
+    // this same tick, so there is zero flicker on warm switches.
+    const albedoCached = mat.mapUrl ? _texCache.get(mat.mapUrl) ?? null : null;
+    const normalCached = mat.normalUrl ? _texCache.get(mat.normalUrl) ?? null : null;
+    const albedoReady = !mat.mapUrl || albedoCached;
+    const normalReady = !mat.normalUrl || normalCached;
+
+    if (albedoReady && normalReady) {
+      begin(albedoCached, normalCached);
+      return;
     }
 
-    morphRef.current.targetScalars = computeScalars(base);
-
-    if (first) {
-      // First mount: no animation — mirror "to" into "from" and apply scalars now.
-      firstMatRunRef.current = false;
-      n.fromColor.value.copy(n.toColor.value);
-      n.fromRough.value = n.toRough.value;
-      n.fromMetal.value = n.toMetal.value;
-      n.fromIsTex.value = n.toIsTex.value;
-      n.fromTex.value = n.toTex.value;
-      applyScalars(m, morphRef.current.targetScalars);
-    } else {
-      morphRef.current.active = true;
-      morphRef.current.t = 0;
-      morphRef.current.scalarsApplied = false;
-      n.progress.value = 0;
-    }
-    invalidate();
+    // Cold path: load the missing texture(s) FIRST, then start the flood, so it
+    // always reveals the correct texture and never snaps mid/post-transition.
+    // The "Loading texture..." indicator (driven by `loadingTex`) covers the
+    // wait. `token` ensures a superseded switch can't apply a stale result.
+    Promise.all([
+      mat.mapUrl ? getCachedTexture(mat.mapUrl, false).catch(() => null) : Promise.resolve(null),
+      mat.normalUrl ? getCachedTexture(mat.normalUrl, true).catch(() => null) : Promise.resolve(null),
+    ]).then(([albedoTex, normalTex]) => begin(albedoTex, normalTex));
   }, [matIndex, invalidate]);
 
   /* -------- Live slider/scalar tweaks (no texture state here) -------- */
@@ -929,7 +943,10 @@ const Scene = memo(function Scene({
 
     // When idle (slider tweak, not a transition), mirror "to" into "from" so the
     // at-rest display updates immediately, and apply the scalar PBR params now.
-    if (!morphRef.current.active) {
+    // While a morph is active OR pending (a switch is mid-flight, possibly
+    // waiting on a cold texture) we must leave the captured "from" snapshot
+    // untouched — the transition effect owns it.
+    if (!morphRef.current.active && !morphRef.current.pending) {
       n.fromColor.value.copy(n.toColor.value);
       n.fromRough.value = n.toRough.value;
       n.fromMetal.value = n.toMetal.value;
